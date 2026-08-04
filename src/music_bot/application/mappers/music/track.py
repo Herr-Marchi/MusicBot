@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from music_bot.application.contracts.dtos.music import TrackDto
+from music_bot.application.contracts.dto import TrackDto
 from music_bot.domain.music.models import Track
 
 

@@ -10,7 +10,7 @@ from music_bot.application.contracts.commands.music import (
     SkipCommand,
     StopCommand,
 )
-from music_bot.application.contracts.dtos.music import TrackDto
+from music_bot.application.contracts.dto import TrackDto
 from music_bot.application.contracts.results.music import (
     NowPlayingResult,
     PlayUrlResult,

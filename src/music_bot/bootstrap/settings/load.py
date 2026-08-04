@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from pydantic import ValidationError
 
-from .errors.base import SettingsLoadError
+from .errors import SettingsLoadError
 from .models import Settings
 
 

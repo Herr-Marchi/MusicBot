@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 from tests.typing_helper import MakeTrack
 
-from music_bot.application.contracts.dtos.music import TrackDto
+from music_bot.application.contracts.dto import TrackDto
 from music_bot.application.mappers.music.track import map_track_to_dto
 from music_bot.domain.music.models import Track
 
