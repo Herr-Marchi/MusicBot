@@ -11,6 +11,7 @@ from music_bot.application.contracts.commands.music import (
     StopCommand,
 )
 from music_bot.domain.music.models import Track
+from tests.fakes import FakeTrackSource
 from tests.typing_helper import (
     MakeNowPlayingCommand,
     MakePlayUrlCommand,
@@ -18,6 +19,11 @@ from tests.typing_helper import (
     MakeStopCommand,
     MakeTrack,
 )
+
+
+@pytest.fixture
+def fake_track_source() -> FakeTrackSource:
+    return FakeTrackSource()
 
 
 @pytest.fixture
