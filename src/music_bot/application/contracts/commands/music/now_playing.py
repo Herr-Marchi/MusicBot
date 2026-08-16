@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from music_bot.application.contracts.results.music import NowPlayingResult
+
+from .base import PlaybackCommand
 
 
-class NowPlayingCommand(BaseModel):
-    guild_id: int = Field(..., gt=0)
-    requested_by: int = Field(..., gt=0)
+class NowPlayingCommand(PlaybackCommand[NowPlayingResult]):
+    pass

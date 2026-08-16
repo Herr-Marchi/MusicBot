@@ -2,97 +2,166 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-from typing import Any
 
 import discord
-from discord.ext import commands
-from yt_dlp import YoutubeDL
+
+from music_bot.adapters.discord import VoiceClientLookup
+from music_bot.application.ports.music_player import TrackFinishedCallback
+from music_bot.application.ports.track_source import TrackStreamResolver
 
 
-class DiscordPlayer:
-    def __init__(self, bot: commands.Bot | None = None) -> None:
-        self._bot: commands.Bot | None = bot
+class DiscordGuildPlayer:
+    def __init__(
+        self,
+        *,
+        guild_id: int,
+        voice_client_lookup: VoiceClientLookup,
+        stream_resolver: TrackStreamResolver,
+    ) -> None:
+        self._guild_id: int = guild_id
+        self._voice_client_lookup: VoiceClientLookup = voice_client_lookup
+        self._stream_resolver: TrackStreamResolver = stream_resolver
+        self._start_task: asyncio.Task[None] | None = None
+        self._cancel_finished_callback: Callable[[], None] | None = None
+        self._pause_requested: bool = False
+        self._volume: int = 100
 
     async def play(
-        self, *, context_id: int, url: str, on_finished: Callable[[int, Exception | None], None]
+        self,
+        *,
+        url: str,
+        volume: int,
+        on_finished: TrackFinishedCallback,
     ) -> None:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        voice_client: discord.VoiceClient = self._voice_client_lookup.require(self._guild_id)
+        if self._start_task is not None or voice_client.is_playing() or voice_client.is_paused():
+            raise RuntimeError(f"Already playing in guild {self._guild_id}")
 
-        if vc.is_playing():
-            raise RuntimeError(f"Already playing in guild {context_id}")
+        self._pause_requested = False
+        self._volume = volume
+        is_callback_active: bool = True
 
-        raw_url: str = await asyncio.to_thread(self._yt_dlp_resolver, url)
-        before_options: str = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5"
-        options: str = "-vn"
+        def cancel_callback() -> None:
+            nonlocal is_callback_active
+            is_callback_active = False
 
-        audio_source: discord.FFmpegPCMAudio = discord.FFmpegPCMAudio(
-            source=raw_url,
-            before_options=before_options,
-            options=options,
+        def after(exception: Exception | None) -> None:
+            nonlocal is_callback_active
+            if not is_callback_active:
+                return
+
+            is_callback_active = False
+            self._pause_requested = False
+            if self._cancel_finished_callback is cancel_callback:
+                self._cancel_finished_callback = None
+            on_finished(exception)
+
+        self._cancel_finished_callback = cancel_callback
+        self._start_task = asyncio.create_task(
+            self._start(
+                voice_client=voice_client,
+                url=url,
+                after=after,
+            )
         )
 
-        vc.play(audio_source, after=lambda exc: on_finished(context_id, exc))
+    async def stop(self) -> None:
+        cancel_callback: Callable[[], None] | None = self._cancel_finished_callback
+        if cancel_callback is not None:
+            cancel_callback()
+            self._cancel_finished_callback = None
 
-    async def stop(self, *, context_id: int) -> None:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        self._pause_requested = False
 
-        vc.stop()
+        start_task: asyncio.Task[None] | None = self._start_task
+        if start_task is not None:
+            start_task.cancel()
+            try:
+                await start_task
+            except asyncio.CancelledError:
+                pass
+            finally:
+                if self._start_task is start_task:
+                    self._start_task = None
 
-    async def pause(self, *, context_id: int) -> None:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        voice_client: discord.VoiceClient | None = self._voice_client_lookup.get(self._guild_id)
+        if voice_client is not None:
+            voice_client.stop()
 
-        if vc.is_playing():
-            vc.pause()
+    async def pause(self) -> None:
+        if self._start_task is not None:
+            self._pause_requested = True
+            return
 
-    async def resume(self, *, context_id: int) -> None:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        voice_client: discord.VoiceClient | None = self._voice_client_lookup.get(self._guild_id)
+        if voice_client is not None and voice_client.is_playing():
+            voice_client.pause()
 
-        if vc.is_paused():
-            vc.resume()
+    async def resume(self) -> None:
+        if self._start_task is not None and self._pause_requested:
+            self._pause_requested = False
+            return
 
-    async def is_playing(self, *, context_id: int) -> bool:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        voice_client: discord.VoiceClient | None = self._voice_client_lookup.get(self._guild_id)
+        if voice_client is not None and voice_client.is_paused():
+            voice_client.resume()
 
-        return vc.is_playing()
+    async def set_volume(self, volume: int) -> None:
+        self._volume = volume
+        voice_client: discord.VoiceClient | None = self._voice_client_lookup.get(self._guild_id)
+        if voice_client is None:
+            return
 
-    async def is_paused(self, *, context_id: int) -> bool:
-        vc: discord.VoiceClient = self._get_vc(context_id)
+        source: discord.AudioSource | None = voice_client.source
+        if isinstance(source, discord.PCMVolumeTransformer):
+            source.volume = volume / 100
 
-        return vc.is_paused()
+    async def _start(
+        self,
+        *,
+        voice_client: discord.VoiceClient,
+        url: str,
+        after: TrackFinishedCallback,
+    ) -> None:
+        source: discord.PCMVolumeTransformer[discord.FFmpegPCMAudio] | None = None
+        source_started: bool = False
+        try:
+            stream_url: str = await self._stream_resolver.resolve_stream(source_url=url)
+            audio: discord.FFmpegPCMAudio = discord.FFmpegPCMAudio(
+                source=stream_url,
+                before_options="-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+                options="-vn",
+            )
+            source = discord.PCMVolumeTransformer(audio, volume=self._volume / 100)
+            voice_client.play(source, after=after)
+            source_started = True
+            if self._pause_requested:
+                voice_client.pause()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            after(exc)
+        finally:
+            if source is not None and not source_started:
+                source.cleanup()
+            current_task: asyncio.Task[None] | None = asyncio.current_task()
+            if self._start_task is current_task:
+                self._start_task = None
 
-    def _get_vc(self, context_id: int) -> discord.VoiceClient:
-        if self._bot is None:
-            raise RuntimeError("Bot not attached")
 
-        guild: discord.Guild | None = self._bot.get_guild(context_id)
-        if guild is None:
-            raise RuntimeError(f"Guild {context_id} not found")
+class DiscordGuildPlayerFactory:
+    def __init__(
+        self,
+        *,
+        voice_client_lookup: VoiceClientLookup,
+        stream_resolver: TrackStreamResolver,
+    ) -> None:
+        self._voice_client_lookup: VoiceClientLookup = voice_client_lookup
+        self._stream_resolver: TrackStreamResolver = stream_resolver
 
-        vc: discord.VoiceProtocol | None = guild.voice_client
-        if not isinstance(vc, discord.VoiceClient):
-            raise RuntimeError(f"Not connected to voice in guild {context_id}")
-
-        return vc
-
-    def _yt_dlp_resolver(self, url: str) -> str:
-        yt_dlp_params: dict[str, Any] = {
-            "format": "bestaudio/best",
-            "noplaylist": True,
-        }
-        with YoutubeDL(yt_dlp_params) as ydl:  # type: ignore[arg-type]
-            info: dict[str, Any] = ydl.extract_info(url, download=False)  # type: ignore[assignment]
-
-        if "entries" in info and isinstance(info["entries"], list) and info["entries"]:
-            first: Any = info["entries"][0]
-            if isinstance(first, dict):
-                info = first
-
-        stream_url: Any = info.get("url")
-
-        if not isinstance(stream_url, str) or not stream_url:
-            raise RuntimeError("yt-dlp could not resolve a playable audio URL")
-
-        return stream_url
-
-    def attach_bot(self, bot: commands.Bot) -> None:
-        self._bot = bot
+    def __call__(self, guild_id: int) -> DiscordGuildPlayer:
+        return DiscordGuildPlayer(
+            guild_id=guild_id,
+            voice_client_lookup=self._voice_client_lookup,
+            stream_resolver=self._stream_resolver,
+        )

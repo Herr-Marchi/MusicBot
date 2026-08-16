@@ -1,13 +1,23 @@
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
-from pydantic import BaseModel, Field
 
+@dataclass(frozen=True, slots=True, kw_only=True)
+class Track:
+    url: str
+    title: str
+    requested_by: int
+    duration_seconds: int
+    requested_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
-class Track(BaseModel):
-    url: str = Field(..., min_length=1)
-    title: str = Field(..., min_length=1)
-    requested_by: int = Field(..., gt=0)
-    requested_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
-    duration_seconds: int = Field(..., ge=0)
+    def __post_init__(self) -> None:
+        if not self.url:
+            raise ValueError("url must not be empty")
+        if not self.title:
+            raise ValueError("title must not be empty")
+        if self.requested_by <= 0:
+            raise ValueError("requested_by must be positive")
+        if self.duration_seconds < 0:
+            raise ValueError("duration_seconds must not be negative")

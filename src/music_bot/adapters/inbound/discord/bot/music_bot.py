@@ -6,10 +6,9 @@ import discord
 from discord import AllowedMentions, ClientUser, Intents, app_commands
 from discord.ext import commands
 
+from music_bot.adapters.discord import VoiceClientLookup
 from music_bot.adapters.inbound.discord.cogs import PingCog, PlaybackCog, VoiceCog
-
-from .dependencies import DiscordDependencies
-from .deps_mapping import to_playback_dependencies
+from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -20,6 +19,7 @@ class MusicBot(commands.Bot):
         *,
         intents: Intents,
         dependencies: DiscordDependencies,
+        voice_client_lookup: VoiceClientLookup,
         dev_guild_id: int | None = None,
     ) -> None:
         allowed_mentions: AllowedMentions = AllowedMentions(
@@ -32,13 +32,14 @@ class MusicBot(commands.Bot):
 
         self.dependencies: DiscordDependencies = dependencies
         self.dev_guild_id: int | None = dev_guild_id
+        voice_client_lookup.bind(self)
 
     async def setup_hook(self) -> None:
         await super().setup_hook()
 
         await self.add_cog(PingCog(self))
-        await self.add_cog(VoiceCog(self))
-        await self.add_cog(PlaybackCog(self, deps=to_playback_dependencies(self.dependencies)))
+        await self.add_cog(VoiceCog(self, deps=self.dependencies))
+        await self.add_cog(PlaybackCog(self, deps=self.dependencies))
 
         synced: list[app_commands.AppCommand]
         if self.dev_guild_id is not None:

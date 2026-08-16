@@ -21,7 +21,6 @@ class MakePlayUrlCommand(Protocol):
         guild_id: int = 1,
         url: str = "https://example.com/a.mp3",
         requested_by: int = 1,
-        title: str | None = None,
     ) -> PlayUrlCommand: ...
 
 

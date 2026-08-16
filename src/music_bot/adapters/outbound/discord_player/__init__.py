@@ -1,5 +1,8 @@
 from __future__ import annotations
 
-from .player import DiscordPlayer
+from .player import DiscordGuildPlayer, DiscordGuildPlayerFactory
 
-__all__ = ("DiscordPlayer",)
+__all__ = (
+    "DiscordGuildPlayer",
+    "DiscordGuildPlayerFactory",
+)

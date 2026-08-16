@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from music_bot.application.contracts.results.music import StopResult
+
+from .base import PlaybackCommand
 
 
-class StopCommand(BaseModel):
-    guild_id: int = Field(..., gt=0)
-    requested_by: int = Field(..., gt=0)
+class StopCommand(PlaybackCommand[StopResult]):
+    pass

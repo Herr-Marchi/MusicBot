@@ -46,13 +46,11 @@ def make_play_url_command() -> MakePlayUrlCommand:
         guild_id: int = 1,
         url: str = "https://example.com/a.mp3",
         requested_by: int = 1,
-        title: str | None = None,
     ) -> PlayUrlCommand:
         return PlayUrlCommand(
             guild_id=guild_id,
             url=url,
             requested_by=requested_by,
-            title=title,
         )
 
     return _make_play_url_command

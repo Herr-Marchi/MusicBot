@@ -1,48 +1,62 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
-from music_bot.application.ports import MusicPlayer, QueueRepository
+from music_bot.application.contracts.commands.music import PlaybackCommand
+from music_bot.application.contracts.errors import PlaybackNotActiveError
+from music_bot.application.contracts.results.music import PlaybackResult
+from music_bot.application.orchestration.music.actor_registry import (
+    GuildPlaybackActorRegistry,
+)
+from music_bot.application.orchestration.music.guild_playback_actor import (
+    GuildPlaybackActor,
+)
 
-from .guild_actor import GuildActor
+
+@dataclass(slots=True)
+class _GuildLockEntry:
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    holders: int = 0
 
 
-class MusicActorManager:
-    def __init__(
-        self,
-        *,
-        queue_repository: QueueRepository,
-        music_player: MusicPlayer,
-    ) -> None:
-        self._actors: dict[int, GuildActor] = {}
+class GuildPlaybackActorManager:
+    def __init__(self, *, actors: GuildPlaybackActorRegistry) -> None:
+        self._actors: GuildPlaybackActorRegistry = actors
+        self._guild_locks: dict[int, _GuildLockEntry] = {}
 
-        self._queue_repository: QueueRepository = queue_repository
-        self._music_player: MusicPlayer = music_player
+    async def execute[ResultT: PlaybackResult](self, command: PlaybackCommand[ResultT]) -> ResultT:
+        async with self._guild_lock(guild_id=command.guild_id):
+            actor: GuildPlaybackActor | None = self._actors.get(guild_id=command.guild_id)
+            if actor is None:
+                if not command.creates_actor:
+                    raise PlaybackNotActiveError
 
-    def get_or_create(self, guild_id: int) -> GuildActor:
-        if guild_id not in self._actors:
-            actor: GuildActor = GuildActor(
-                queue_repository=self._queue_repository,
-                music_player=self._music_player,
-            )
-            actor.start()
-            self._actors[guild_id] = actor
+                actor = await self._actors.create_or_restore(guild_id=command.guild_id)
 
-        return self._actors[guild_id]
+            return await actor.execute(command)
 
-    def get(self, guild_id: int) -> GuildActor | None:
-        return self._actors.get(guild_id)
-
-    async def stop(self, guild_id: int) -> None:
-        actor: GuildActor | None = self._actors.get(guild_id)
-        if actor is not None:
-            await actor.stop()
-
-    async def stop_and_remove(self, guild_id: int) -> None:
-        await self.stop(guild_id)
-
-        self._actors.pop(guild_id, None)
+    async def remove(self, *, guild_id: int) -> None:
+        async with self._guild_lock(guild_id=guild_id):
+            await self._actors.remove(guild_id=guild_id)
 
     async def shutdown(self) -> None:
-        await asyncio.gather(*(actor.stop() for actor in self._actors.values()))
-        self._actors.clear()
+        await self._actors.shutdown()
+
+    @asynccontextmanager
+    async def _guild_lock(self, *, guild_id: int) -> AsyncIterator[None]:
+        entry: _GuildLockEntry | None = self._guild_locks.get(guild_id)
+        if entry is None:
+            entry = _GuildLockEntry()
+            self._guild_locks[guild_id] = entry
+        entry.holders += 1
+
+        try:
+            async with entry.lock:
+                yield
+        finally:
+            entry.holders -= 1
+            if entry.holders == 0 and self._guild_locks.get(guild_id) is entry:
+                del self._guild_locks[guild_id]

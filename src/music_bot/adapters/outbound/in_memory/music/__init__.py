@@ -1,5 +1,5 @@
 from __future__ import annotations
 
-from .queue_repository import InMemoryQueueRepository
+from .guild_playback_repository import InMemoryGuildPlaybackRepository
 
-__all__ = ("InMemoryQueueRepository",)
+__all__ = ("InMemoryGuildPlaybackRepository",)

@@ -8,14 +8,14 @@ class NotInVoiceError(DiscordAdapterError):
         super().__init__("You must be in a voice channel to use this command.")
 
 
+class NotInSameVoiceChannelError(DiscordAdapterError):
+    def __init__(self) -> None:
+        super().__init__("You must be in the same voice channel as the bot to do that.")
+
+
 class UnsupportedVoiceChannelError(DiscordAdapterError):
     def __init__(self) -> None:
         super().__init__("Only standard voice channels are supported.")
-
-
-class NotConnectedToVoiceError(DiscordAdapterError):
-    def __init__(self) -> None:
-        super().__init__("I'm not connected to a voice channel.")
 
 
 class VoiceForbiddenError(DiscordAdapterError):

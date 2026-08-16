@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from .interaction_data import require_guild, require_member, require_voice_connected
-from .voice_connection import disconnect_voice_client, ensure_voice_connected
+from .interaction_context import InteractionContext, begin_interaction
+from .interaction_data import require_guild, require_member
 
 __all__ = (
-    "disconnect_voice_client",
-    "ensure_voice_connected",
+    "InteractionContext",
+    "begin_interaction",
     "require_guild",
     "require_member",
-    "require_voice_connected",
 )

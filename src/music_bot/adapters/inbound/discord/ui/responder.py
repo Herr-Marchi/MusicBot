@@ -42,6 +42,28 @@ class Responder:
         )
         await self._send_private(embed)
 
+    async def announce(
+        self,
+        message: str,
+        *,
+        channel: discord.abc.Messageable,
+        title: str | None = None,
+    ) -> None:
+        """Post a message visible to whoever can see `channel`.
+
+        Reserved for events already audible there (a track starting to
+        play) and scoped to the voice channel it's playing in, not the
+        arbitrary text channel the command happened to be typed in: callers
+        pass `voice_client.channel`, not the interaction's own channel.
+        """
+        embed: discord.Embed = (
+            format_info(message) if title is None else format_info(message, title=title)
+        )
+        try:
+            await channel.send(embed=embed)
+        except discord.HTTPException as exc:
+            logger.warning(f"Failed to send public announcement: {exc}")
+
     async def _send_private(self, embed: discord.Embed) -> None:
         try:
             if not self._interaction.response.is_done():

@@ -3,7 +3,7 @@ from __future__ import annotations
 from .base import DiscordAdapterError
 from .context import NotAMemberError, NotInGuildError
 from .voice import (
-    NotConnectedToVoiceError,
+    NotInSameVoiceChannelError,
     NotInVoiceError,
     UnsupportedVoiceChannelError,
     VoiceConnectionError,
@@ -14,8 +14,8 @@ from .voice import (
 __all__ = (
     "DiscordAdapterError",
     "NotAMemberError",
-    "NotConnectedToVoiceError",
     "NotInGuildError",
+    "NotInSameVoiceChannelError",
     "NotInVoiceError",
     "UnsupportedVoiceChannelError",
     "VoiceConnectionError",

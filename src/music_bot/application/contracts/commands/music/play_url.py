@@ -1,10 +1,15 @@
 from __future__ import annotations
 
-from pydantic import BaseModel, Field
+from typing import ClassVar
+
+from pydantic import Field
+
+from music_bot.application.contracts.results.music import PlayUrlResult
+
+from .base import PlaybackCommand
 
 
-class PlayUrlCommand(BaseModel):
-    guild_id: int = Field(..., gt=0)
+class PlayUrlCommand(PlaybackCommand[PlayUrlResult]):
     url: str = Field(..., min_length=1)
-    requested_by: int = Field(..., gt=0)
-    title: str | None = Field(default=None)
+
+    creates_actor: ClassVar[bool] = True
