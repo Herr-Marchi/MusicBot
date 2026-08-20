@@ -13,6 +13,7 @@ from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 from music_bot.adapters.inbound.discord.voice_manager import DiscordVoiceManager
 from music_bot.adapters.outbound.discord_player import DiscordGuildPlayerFactory
 from music_bot.adapters.outbound.postgres import (
+    PostgresPlaylistUoWFactory,
     PostgresTrackCatalog,
     create_engine,
     create_session_factory,
@@ -23,6 +24,7 @@ from music_bot.application.orchestration.music import (
     GuildPlaybackActorManager,
     GuildPlaybackActorRegistry,
 )
+from music_bot.application.orchestration.playlists import PlaylistService
 from music_bot.application.orchestration.track_metadata_resolver import (
     CatalogBackedTrackMetadataResolver,
 )
@@ -38,6 +40,7 @@ from .settings import Settings
 class Container:
     settings: Settings
     postgres_engine: AsyncEngine
+    playlist_uow_factory: PostgresPlaylistUoWFactory
     redis_client: Redis
     playback_repository: GuildPlaybackRepository
     track_source: TrackSource
@@ -50,6 +53,9 @@ class Container:
         postgres_engine: AsyncEngine = cls._create_postgres_engine(settings=settings)
         postgres_session_factory: async_sessionmaker[AsyncSession] = (
             cls._create_postgres_session_factory(engine=postgres_engine)
+        )
+        playlist_uow_factory: PostgresPlaylistUoWFactory = cls._create_playlist_uow_factory(
+            session_factory=postgres_session_factory
         )
 
         redis_client: Redis = cls._create_redis_client(settings=settings)
@@ -79,9 +85,14 @@ class Container:
         playback_manager: GuildPlaybackActorManager = cls._create_playback_manager(
             playback_actors=playback_actors
         )
+        playlist_service: PlaylistService = cls._create_playlist_service(
+            uow_factory=playlist_uow_factory,
+            metadata_resolver=catalog_backed_metadata_resolver,
+        )
         discord_dependencies: DiscordDependencies = cls._create_discord_dependencies(
             playback_manager=playback_manager,
             voice_manager=voice_manager,
+            playlist_service=playlist_service,
         )
         discord_bot: MusicBot = cls._create_discord_bot(
             settings=settings,
@@ -98,6 +109,7 @@ class Container:
         return cls(
             settings=settings,
             postgres_engine=postgres_engine,
+            playlist_uow_factory=playlist_uow_factory,
             redis_client=redis_client,
             playback_repository=playback_repository,
             track_source=track_source,
@@ -115,6 +127,12 @@ class Container:
         *, engine: AsyncEngine
     ) -> async_sessionmaker[AsyncSession]:
         return create_session_factory(engine=engine)
+
+    @staticmethod
+    def _create_playlist_uow_factory(
+        *, session_factory: async_sessionmaker[AsyncSession]
+    ) -> PostgresPlaylistUoWFactory:
+        return PostgresPlaylistUoWFactory(session_factory=session_factory)
 
     @staticmethod
     def _create_redis_client(*, settings: Settings) -> Redis:
@@ -189,14 +207,24 @@ class Container:
         return GuildPlaybackActorManager(actors=playback_actors)
 
     @staticmethod
+    def _create_playlist_service(
+        *,
+        uow_factory: PostgresPlaylistUoWFactory,
+        metadata_resolver: TrackMetadataResolver,
+    ) -> PlaylistService:
+        return PlaylistService(uow_factory=uow_factory, metadata_resolver=metadata_resolver)
+
+    @staticmethod
     def _create_discord_dependencies(
         *,
         playback_manager: GuildPlaybackActorManager,
         voice_manager: DiscordVoiceManager,
+        playlist_service: PlaylistService,
     ) -> DiscordDependencies:
         return DiscordDependencies(
             voice_manager=voice_manager,
             playback_manager=playback_manager,
+            playlist_service=playlist_service,
         )
 
     @staticmethod
