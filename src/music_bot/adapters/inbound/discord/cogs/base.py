@@ -13,8 +13,8 @@ from music_bot.application.contracts.errors import (
     NotPlaylistOwnerError,
     PlaybackNotActiveError,
     PlaylistNotFoundError,
-    TrackMetadataResolutionError,
 )
+from music_bot.application.ports.track_source import TrackSourceError
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -22,6 +22,21 @@ logger: logging.Logger = logging.getLogger(__name__)
 class BaseCog(commands.Cog, name="BaseCog"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot: commands.Bot = bot
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        command_name: str = (
+            interaction.command.qualified_name if interaction.command is not None else "unknown"
+        )
+        logger.info(
+            "Discord command started interaction_id=%s command=%s guild_id=%s "
+            "user_id=%s channel_id=%s",
+            interaction.id,
+            command_name,
+            interaction.guild_id,
+            interaction.user.id,
+            interaction.channel_id,
+        )
+        return True
 
     async def cog_app_command_error(
         self,
@@ -34,11 +49,24 @@ class BaseCog(commands.Cog, name="BaseCog"):
         if isinstance(error, app_commands.CommandInvokeError):
             root = error.original
 
+        command_name: str = (
+            interaction.command.qualified_name if interaction.command is not None else "unknown"
+        )
+        logger.info(
+            "Discord interaction failed interaction_id=%s command=%s guild_id=%s "
+            "user_id=%s error=%s",
+            interaction.id,
+            command_name,
+            interaction.guild_id,
+            interaction.user.id,
+            type(root).__name__,
+        )
+
         if isinstance(root, DiscordAdapterError | NotConnectedToVoiceError):
             await responder.error(str(root))
             return
 
-        if isinstance(root, TrackMetadataResolutionError):
+        if isinstance(root, TrackSourceError):
             await responder.error(str(root), title="Could not resolve track")
             return
 

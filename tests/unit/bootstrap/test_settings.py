@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from music_bot.bootstrap.settings.models import Settings
+from music_bot.bootstrap.settings.types import LogLevel
 
 BASE_ENV: dict[str, str] = {
     "DISCORD_TOKEN": "token",
@@ -27,3 +28,11 @@ class TestDiscordGuildId:
         settings: Settings = Settings.model_validate({**BASE_ENV, "DISCORD_GUILD_ID": "123"})
 
         assert settings.discord_guild_id == 123
+
+
+@pytest.mark.unit
+class TestLoggingSettings:
+    def test_default_level_is_debug(self) -> None:
+        settings: Settings = Settings.model_validate(BASE_ENV)
+
+        assert settings.log_level is LogLevel.DEBUG

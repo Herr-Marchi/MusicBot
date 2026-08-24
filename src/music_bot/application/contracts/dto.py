@@ -5,7 +5,7 @@ from datetime import datetime
 
 
 @dataclass(frozen=True, slots=True)
-class TrackDto:
+class QueuedTrackDto:
     url: str
     title: str
     requested_by: int

@@ -4,6 +4,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol
 
+from music_bot.application.ports.track import StoredTrack
 from music_bot.domain.playlists.models import PlaylistAccess
 
 
@@ -16,17 +17,9 @@ class PlaylistData:
 
 
 @dataclass(frozen=True, slots=True, kw_only=True)
-class TrackData:
+class PlaylistEntry:
     id: str
-    url: str
-    title: str
-    duration_seconds: int
-
-
-@dataclass(frozen=True, slots=True, kw_only=True)
-class PlaylistTrackData:
-    id: str
-    track: TrackData
+    track: StoredTrack
     position: int
 
 
@@ -55,15 +48,8 @@ class PlaylistRepository(Protocol):
 
     async def list(self, *, visibility: PlaylistVisibility) -> Sequence[PlaylistData]: ...
 
-    async def get_tracks(self, *, playlist_id: str) -> Sequence[PlaylistTrackData]: ...
+    async def get_tracks(self, *, playlist_id: str) -> Sequence[PlaylistEntry]: ...
 
-    async def add_track(
-        self,
-        *,
-        playlist_id: str,
-        url: str,
-        title: str,
-        duration_seconds: int,
-    ) -> PlaylistTrackData: ...
+    async def add_track(self, *, playlist_id: str, track: StoredTrack) -> PlaylistEntry: ...
 
-    async def remove_track(self, *, playlist_track_id: str) -> None: ...
+    async def remove_track(self, *, entry_id: str) -> None: ...

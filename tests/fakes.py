@@ -4,16 +4,21 @@ from collections.abc import Sequence
 from types import TracebackType
 from typing import Self
 
-from music_bot.application.ports.music_player import TrackFinishedCallback
+from music_bot.application.ports.music_player import (
+    PlaybackSettingsProvider,
+    TrackFinishedCallback,
+)
 from music_bot.application.ports.playlists import (
     DiscordUserData,
     PlaylistData,
-    PlaylistTrackData,
+    PlaylistEntry,
     PlaylistVisibility,
-    TrackData,
 )
-from music_bot.application.ports.track_catalog import CatalogedTrack
-from music_bot.application.ports.track_source import TrackMetadata
+from music_bot.application.ports.track import StoredTrack
+from music_bot.application.ports.track_source import (
+    TrackMetadata,
+    TrackSource,
+)
 from music_bot.domain.playlists.models import PlaylistAccess
 
 
@@ -30,10 +35,10 @@ class FakeGuildPlayer:
         self,
         *,
         url: str,
-        volume: int,
+        settings: PlaybackSettingsProvider,
         on_finished: TrackFinishedCallback,
     ) -> None:
-        self.play_calls.append((url, volume))
+        self.play_calls.append((url, settings().volume))
         self.on_finished_callback = on_finished
 
     async def stop(self) -> None:
@@ -57,7 +62,7 @@ class FakeGuildPlayer:
         callback(exception)
 
 
-class FakeTrackSource:
+class FakeTrackSource(TrackSource):
     def __init__(self) -> None:
         self.resolve_calls: list[str] = []
         self.resolve_stream_calls: list[str] = []
@@ -73,7 +78,7 @@ class FakeTrackSource:
         canonical_url: str | None = None,
     ) -> None:
         self._metadata_by_url[source_url] = TrackMetadata(
-            source_url=canonical_url or source_url,
+            url=canonical_url or source_url,
             title=title,
             duration_seconds=duration_seconds,
         )
@@ -81,47 +86,74 @@ class FakeTrackSource:
     def fail_resolve_with(self, error: Exception) -> None:
         self._resolve_error = error
 
-    async def resolve(self, *, source_url: str) -> TrackMetadata:
+    async def validate_url(self, *, source_url: str) -> TrackSource:
+        return self
+
+    async def _resolve_metadata(self, *, source_url: str) -> TrackMetadata:
         self.resolve_calls.append(source_url)
 
         if self._resolve_error is not None:
             raise self._resolve_error
 
         return self._metadata_by_url.get(source_url) or TrackMetadata(
-            source_url=source_url,
+            url=source_url,
             title=source_url,
             duration_seconds=100,
         )
 
-    async def resolve_stream(self, *, source_url: str) -> str:
+    async def _resolve_stream(self, *, source_url: str) -> str:
         self.resolve_stream_calls.append(source_url)
         return f"{source_url}#stream"
 
 
-class FakeTrackCatalog:
+class FakeTrackRepository:
     def __init__(self) -> None:
         self.get_calls: list[str] = []
-        self.upsert_calls: list[tuple[str, str, int]] = []
-        self._by_url: dict[str, CatalogedTrack] = {}
+        self.save_calls: list[tuple[str, str, int]] = []
+        self._by_url: dict[str, StoredTrack] = {}
+        self._next_id: int = 1
 
     def seed(self, url: str, *, title: str, duration_seconds: int) -> None:
-        self._by_url[url] = CatalogedTrack(url=url, title=title, duration_seconds=duration_seconds)
+        self._by_url[url] = StoredTrack(
+            id=self._fresh_id(), url=url, title=title, duration_seconds=duration_seconds
+        )
 
-    async def get(self, *, url: str) -> CatalogedTrack | None:
+    def forget(self, url: str) -> None:
+        self._by_url.pop(url, None)
+
+    async def get_by_url(self, *, url: str) -> StoredTrack | None:
         self.get_calls.append(url)
         return self._by_url.get(url)
 
-    async def upsert(self, *, url: str, title: str, duration_seconds: int) -> CatalogedTrack:
-        self.upsert_calls.append((url, title, duration_seconds))
-        cataloged = CatalogedTrack(url=url, title=title, duration_seconds=duration_seconds)
-        self._by_url[url] = cataloged
-        return cataloged
+    async def save(
+        self,
+        *,
+        url: str,
+        title: str,
+        duration_seconds: int,
+    ) -> StoredTrack:
+        self.save_calls.append((url, title, duration_seconds))
+        existing: StoredTrack | None = self._by_url.get(url)
+        track_id: str = existing.id if existing is not None else self._fresh_id()
+        stored_track: StoredTrack = StoredTrack(
+            id=track_id,
+            url=url,
+            title=title,
+            duration_seconds=duration_seconds,
+        )
+        self._by_url[url] = stored_track
+        return stored_track
+
+    def _fresh_id(self) -> str:
+        track_id: str = str(self._next_id)
+        self._next_id += 1
+        return track_id
 
 
 class FakePlaylistRepository:
     def __init__(self) -> None:
         self._playlists: dict[str, PlaylistData] = {}
-        self._tracks: dict[str, list[PlaylistTrackData]] = {}
+        self._tracks: dict[str, list[PlaylistEntry]] = {}
         self._next_id: int = 1
 
     def _fresh_id(self) -> str:
@@ -172,29 +204,21 @@ class FakePlaylistRepository:
                 result.append(playlist)
         return result
 
-    async def get_tracks(self, *, playlist_id: str) -> Sequence[PlaylistTrackData]:
+    async def get_tracks(self, *, playlist_id: str) -> Sequence[PlaylistEntry]:
         return list(self._tracks.get(playlist_id, []))
 
-    async def add_track(
-        self,
-        *,
-        playlist_id: str,
-        url: str,
-        title: str,
-        duration_seconds: int,
-    ) -> PlaylistTrackData:
-        track_id: str = self._fresh_id()
-        playlist_track = PlaylistTrackData(
-            id=track_id,
-            track=TrackData(id=track_id, url=url, title=title, duration_seconds=duration_seconds),
+    async def add_track(self, *, playlist_id: str, track: StoredTrack) -> PlaylistEntry:
+        playlist_track = PlaylistEntry(
+            id=self._fresh_id(),
+            track=track,
             position=len(self._tracks.get(playlist_id, [])),
         )
         self._tracks[playlist_id].append(playlist_track)
         return playlist_track
 
-    async def remove_track(self, *, playlist_track_id: str) -> None:
+    async def remove_track(self, *, entry_id: str) -> None:
         for playlist_id, tracks in self._tracks.items():
-            self._tracks[playlist_id] = [t for t in tracks if t.id != playlist_track_id]
+            self._tracks[playlist_id] = [t for t in tracks if t.id != entry_id]
 
 
 class FakeUserRepository:
@@ -212,14 +236,16 @@ class FakeUserRepository:
         return user
 
 
-class FakePlaylistUoW:
+class FakeUoW:
     def __init__(
         self,
         *,
         playlist_repository: FakePlaylistRepository,
+        track_repository: FakeTrackRepository,
         user_repository: FakeUserRepository,
     ) -> None:
         self.playlist_repository: FakePlaylistRepository = playlist_repository
+        self.track_repository: FakeTrackRepository = track_repository
         self.user_repository: FakeUserRepository = user_repository
         self.commit_calls: int = 0
         self.rollback_calls: int = 0
@@ -242,15 +268,17 @@ class FakePlaylistUoW:
         self.rollback_calls += 1
 
 
-class FakePlaylistUoWFactory:
+class FakeUoWFactory:
     def __init__(self) -> None:
         self.playlist_repository: FakePlaylistRepository = FakePlaylistRepository()
+        self.track_repository: FakeTrackRepository = FakeTrackRepository()
         self.user_repository: FakeUserRepository = FakeUserRepository()
-        self.uows: list[FakePlaylistUoW] = []
+        self.uows: list[FakeUoW] = []
 
-    def __call__(self) -> FakePlaylistUoW:
-        uow = FakePlaylistUoW(
+    def __call__(self) -> FakeUoW:
+        uow = FakeUoW(
             playlist_repository=self.playlist_repository,
+            track_repository=self.track_repository,
             user_repository=self.user_repository,
         )
         self.uows.append(uow)

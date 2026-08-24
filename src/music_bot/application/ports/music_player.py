@@ -1,9 +1,19 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Protocol
 
 type TrackFinishedCallback = Callable[[Exception | None], None]
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackSettings:
+    volume: int
+    is_paused: bool
+
+
+type PlaybackSettingsProvider = Callable[[], PlaybackSettings]
 
 
 class GuildPlayer(Protocol):
@@ -11,7 +21,7 @@ class GuildPlayer(Protocol):
         self,
         *,
         url: str,
-        volume: int,
+        settings: PlaybackSettingsProvider,
         on_finished: TrackFinishedCallback,
     ) -> None: ...
 

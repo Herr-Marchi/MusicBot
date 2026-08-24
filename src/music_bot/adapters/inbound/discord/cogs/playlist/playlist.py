@@ -9,10 +9,12 @@ from discord.ext import commands
 from music_bot.adapters.inbound.discord.cogs.base import BaseCog
 from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 from music_bot.adapters.inbound.discord.helpers import InteractionContext, begin_interaction
+from music_bot.adapters.inbound.discord.voice_manager import VoiceConnectionLease
 from music_bot.application.contracts.commands.music import PlayPlaylistCommand
+from music_bot.application.contracts.errors import PlaylistNotFoundError
 from music_bot.application.contracts.results.music import PlayPlaylistResult
 from music_bot.application.orchestration.playlists import PlaylistDetail
-from music_bot.application.ports.playlists import PlaylistData, PlaylistTrackData
+from music_bot.application.ports.playlists import PlaylistData, PlaylistEntry
 from music_bot.domain.playlists.models import PlaylistAccess
 
 type AccessChoice = Literal["private", "public"]
@@ -144,18 +146,15 @@ class PlaylistCog(BaseCog, name="Playlist"):
             body, title=f"{detail.playlist.title} · {len(detail.tracks)} track(s)"
         )
 
-    @playlist_group.command(name="add", description="Add a track to a playlist, searched by name")
-    @app_commands.describe(
-        playlist="Playlist to add to",
-        query="Song name, artist, or other search text — not a link",
-    )
+    @playlist_group.command(name="add", description="Add a track to a playlist")
+    @app_commands.describe(playlist="Playlist to add to", url="The URL of the track to add")
     @app_commands.autocomplete(playlist=_autocomplete_editable)
-    async def add(self, interaction: Interaction, playlist: str, query: str) -> None:
+    async def add(self, interaction: Interaction, playlist: str, url: str) -> None:
         ctx: InteractionContext = await begin_interaction(interaction)
-        track: PlaylistTrackData = await self.deps.playlist_service.add_track(
+        track: PlaylistEntry = await self.deps.playlist_service.add_track(
             playlist_id=playlist,
             requested_by=ctx.member.id,
-            url=query,
+            url=url,
         )
         await ctx.responder.success(f"Added **{track.track.title}** to the playlist.")
 
@@ -184,29 +183,33 @@ class PlaylistCog(BaseCog, name="Playlist"):
     @app_commands.autocomplete(playlist=_autocomplete_readable)
     async def play(self, interaction: Interaction, playlist: str) -> None:
         ctx: InteractionContext = await begin_interaction(interaction)
-        detail: PlaylistDetail = await self.deps.playlist_service.get(
-            playlist_id=playlist, requested_by=ctx.member.id
-        )
-        if not detail.tracks:
-            await ctx.responder.info("This playlist has no tracks.")
-            return
-
-        voice_client: VoiceClient = await self.deps.voice_manager.connect(
+        connection: VoiceConnectionLease = await self.deps.voice_manager.connect(
             guild=ctx.guild, member=ctx.member
         )
 
-        outcome: PlayPlaylistResult = await self.deps.playback_manager.execute(
-            PlayPlaylistCommand(
-                guild_id=ctx.guild.id,
-                requested_by=ctx.member.id,
-                urls=[track.track.url for track in detail.tracks],
+        try:
+            outcome: PlayPlaylistResult = await self.deps.playback_manager.execute(
+                PlayPlaylistCommand(
+                    guild_id=ctx.guild.id,
+                    requested_by=ctx.member.id,
+                    playlist_id=playlist,
+                )
             )
-        )
+        except PlaylistNotFoundError:
+            await connection.rollback()
+            raise
 
+        if outcome.queued_count == 0:
+            await connection.rollback()
+            await ctx.responder.info("This playlist has no tracks.")
+            return
+
+        connection.retain()
+        voice_client: VoiceClient = connection.voice_client
         await ctx.responder.success(f"Queued {outcome.queued_count} track(s) from the playlist.")
         if outcome.started_playing:
             await ctx.responder.announce(
-                f"Playlist **{detail.playlist.title}**",
+                f"Playlist **{outcome.playlist_title}**",
                 channel=voice_client.channel,
                 title="Now playing",
             )

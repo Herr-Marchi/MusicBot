@@ -20,7 +20,9 @@ class Responder:
             return
 
         try:
+            logger.debug("Deferring Discord interaction interaction_id=%s", self._interaction.id)
             await self._interaction.response.defer(ephemeral=True)
+            logger.debug("Discord interaction deferred interaction_id=%s", self._interaction.id)
         except (discord.InteractionResponded, discord.NotFound, discord.HTTPException) as exc:
             logger.warning(f"Failed to defer _interaction: {exc}")
 
@@ -28,17 +30,35 @@ class Responder:
         embed: discord.Embed = (
             format_success(message) if title is None else format_success(message, title=title)
         )
+        logger.debug(
+            "Sending success response interaction_id=%s title=%r message_length=%s",
+            self._interaction.id,
+            title,
+            len(message),
+        )
         await self._send_private(embed)
 
     async def info(self, message: str, *, title: str | None = None) -> None:
         embed: discord.Embed = (
             format_info(message) if title is None else format_info(message, title=title)
         )
+        logger.debug(
+            "Sending info response interaction_id=%s title=%r message_length=%s",
+            self._interaction.id,
+            title,
+            len(message),
+        )
         await self._send_private(embed)
 
     async def error(self, message: str, *, title: str | None = None) -> None:
         embed: discord.Embed = (
             format_error(message) if title is None else format_error(message, title=title)
+        )
+        logger.debug(
+            "Sending error response interaction_id=%s title=%r message_length=%s",
+            self._interaction.id,
+            title,
+            len(message),
         )
         await self._send_private(embed)
 
@@ -60,7 +80,20 @@ class Responder:
             format_info(message) if title is None else format_info(message, title=title)
         )
         try:
+            logger.debug(
+                "Sending Discord announcement interaction_id=%s channel_id=%s title=%r "
+                "message_length=%s",
+                self._interaction.id,
+                getattr(channel, "id", None),
+                title,
+                len(message),
+            )
             await channel.send(embed=embed)
+            logger.debug(
+                "Discord announcement sent interaction_id=%s channel_id=%s",
+                self._interaction.id,
+                getattr(channel, "id", None),
+            )
         except discord.HTTPException as exc:
             logger.warning(f"Failed to send public announcement: {exc}")
 
@@ -68,8 +101,12 @@ class Responder:
         try:
             if not self._interaction.response.is_done():
                 await self._interaction.response.send_message(embed=embed, ephemeral=True)
+                logger.debug(
+                    "Discord initial response sent interaction_id=%s", self._interaction.id
+                )
                 return
 
             await self._interaction.followup.send(embed=embed, ephemeral=True)
+            logger.debug("Discord follow-up sent interaction_id=%s", self._interaction.id)
         except (discord.InteractionResponded, discord.NotFound, discord.HTTPException) as exc:
             logger.warning(f"Failed to send message: {exc}")

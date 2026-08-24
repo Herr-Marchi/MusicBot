@@ -3,15 +3,15 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from tests.fakes import FakeTrackSource
 
-from music_bot.adapters.outbound.postgres import PostgresPlaylistUoWFactory, PostgresTrackCatalog
+from music_bot.adapters.outbound.postgres import PostgresUoWFactory
 from music_bot.application.contracts.errors import NotPlaylistOwnerError, PlaylistNotFoundError
 from music_bot.application.orchestration.playlists import PlaylistDetail
 from music_bot.application.orchestration.playlists.service import PlaylistService
+from music_bot.application.orchestration.track_service import TrackService
 from music_bot.application.ports.playlists import PlaylistData
-from music_bot.application.ports.track_catalog import CatalogedTrack
+from music_bot.application.ports.track import StoredTrack
 from music_bot.domain.playlists.models import PlaylistAccess
 
 
@@ -21,10 +21,11 @@ def _unique_user_id() -> int:
 
 @pytest.fixture
 def playlist_service(
-    playlist_uow_factory: PostgresPlaylistUoWFactory,
+    postgres_uow_factory: PostgresUoWFactory,
     fake_track_source: FakeTrackSource,
 ) -> PlaylistService:
-    return PlaylistService(uow_factory=playlist_uow_factory, metadata_resolver=fake_track_source)
+    track_service: TrackService = TrackService(source=fake_track_source)
+    return PlaylistService(uow_factory=postgres_uow_factory, track_service=track_service)
 
 
 @pytest.mark.integration
@@ -150,11 +151,11 @@ class TestPlaylistLifecycleAgainstRealPostgres:
         for created in (mine, theirs_public, theirs_private):
             await playlist_service.delete(playlist_id=created.id, requested_by=created.owner_id)
 
-    async def test_deleting_playlist_does_not_delete_track_catalog_entry(
+    async def test_deleting_playlist_does_not_delete_track(
         self,
         playlist_service: PlaylistService,
         fake_track_source: FakeTrackSource,
-        postgres_session_factory: async_sessionmaker[AsyncSession],
+        postgres_uow_factory: PostgresUoWFactory,
     ) -> None:
         owner_id: int = _unique_user_id()
         url = f"https://example.com/{uuid.uuid4()}.mp3"
@@ -166,8 +167,8 @@ class TestPlaylistLifecycleAgainstRealPostgres:
         await playlist_service.add_track(playlist_id=playlist.id, requested_by=owner_id, url=url)
         await playlist_service.delete(playlist_id=playlist.id, requested_by=owner_id)
 
-        catalog = PostgresTrackCatalog(session_factory=postgres_session_factory)
-        cataloged: CatalogedTrack | None = await catalog.get(url=url)
+        async with postgres_uow_factory() as uow:
+            stored: StoredTrack | None = await uow.track_repository.get_by_url(url=url)
 
-        assert cataloged is not None
-        assert cataloged.title == "Shared Track"
+        assert stored is not None
+        assert stored.title == "Shared Track"

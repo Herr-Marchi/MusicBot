@@ -6,6 +6,7 @@ from discord.ext import commands
 from music_bot.adapters.inbound.discord.cogs.base import BaseCog
 from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 from music_bot.adapters.inbound.discord.helpers import InteractionContext, begin_interaction
+from music_bot.adapters.inbound.discord.voice_manager import VoiceConnectionLease
 from music_bot.application.contracts.commands.music import (
     GetQueueCommand,
     NowPlayingCommand,
@@ -18,7 +19,7 @@ from music_bot.application.contracts.commands.music import (
     SkipCommand,
     StopCommand,
 )
-from music_bot.application.contracts.dto import TrackDto
+from music_bot.application.contracts.dto import QueuedTrackDto
 from music_bot.application.contracts.results.music import (
     GetQueueResult,
     NowPlayingResult,
@@ -38,21 +39,24 @@ class PlaybackCog(BaseCog, name="Playback"):
         super().__init__(bot)
         self.deps: DiscordDependencies = deps
 
-    @app_commands.command(name="play", description="Plays a track, searched by song name/artist")
-    @app_commands.describe(query="Song name, artist, or other search text — not a link")
-    async def play(self, interaction: Interaction, query: str) -> None:
+    @app_commands.command(name="play", description="Plays a track")
+    @app_commands.describe(url="The URL of the track to play")
+    async def play(self, interaction: Interaction, url: str) -> None:
         ctx: InteractionContext = await begin_interaction(interaction)
-        voice_client: VoiceClient = await self.deps.voice_manager.connect(
+        connection: VoiceConnectionLease = await self.deps.voice_manager.connect(
             guild=ctx.guild, member=ctx.member
         )
-
-        result: PlayUrlResult = await self.deps.playback_manager.execute(
-            PlayUrlCommand(
-                guild_id=ctx.guild.id,
-                url=query,
-                requested_by=ctx.member.id,
+        async with connection:
+            result: PlayUrlResult = await self.deps.playback_manager.execute(
+                PlayUrlCommand(
+                    guild_id=ctx.guild.id,
+                    url=url,
+                    requested_by=ctx.member.id,
+                )
             )
-        )
+            connection.retain()
+
+        voice_client: VoiceClient = connection.voice_client
         await ctx.responder.success(
             f"Added **{result.track.title}** to position {result.queue_size}."
         )
@@ -121,7 +125,7 @@ class PlaybackCog(BaseCog, name="Playback"):
         result: GetQueueResult = await self.deps.playback_manager.execute(
             GetQueueCommand(guild_id=ctx.guild.id, requested_by=ctx.member.id)
         )
-        visible_tracks: tuple[TrackDto, ...] = result.tracks[:20]
+        visible_tracks: tuple[QueuedTrackDto, ...] = result.tracks[:20]
         lines: list[str] = [
             f"{position}. **{track.title}** — requested by <@{track.requested_by}>"
             for position, track in enumerate(visible_tracks, start=1)

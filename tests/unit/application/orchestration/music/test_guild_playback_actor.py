@@ -4,37 +4,83 @@ import asyncio
 from typing import cast
 
 import pytest
-from tests.fakes import FakeGuildPlayer, FakeTrackSource
+from tests.fakes import FakeGuildPlayer, FakeTrackSource, FakeUoWFactory
 from tests.typing_helper import MakePlayUrlCommand, MakeSkipCommand, MakeStopCommand
 from tests.unit.application.orchestration.music.conftest import MakeActor
 
 from music_bot.adapters.outbound.in_memory.music import InMemoryGuildPlaybackRepository
 from music_bot.application.contracts.commands.music import (
+    GetQueueCommand,
+    NowPlayingCommand,
+    PauseCommand,
     PlayPlaylistCommand,
     PlayUrlCommand,
+    ResumeCommand,
+    SetLoopCommand,
+    SetVolumeCommand,
     StopCommand,
 )
-from music_bot.application.contracts.errors import TrackMetadataResolutionError
 from music_bot.application.contracts.results.music import (
+    GetQueueResult,
+    NowPlayingResult,
+    PauseResult,
     PlayPlaylistResult,
     PlayUrlResult,
+    ResumeResult,
+    SetLoopResult,
+    SetVolumeResult,
     SkipResult,
     StopResult,
 )
 from music_bot.application.orchestration.music.guild_playback_actor import GuildPlaybackActor
-from music_bot.application.orchestration.music.handlers import play_url as play_url_module
-from music_bot.application.ports.track_source import TrackMetadata
+from music_bot.application.orchestration.music.handlers import PlayUrlCommandHandler
+from music_bot.application.orchestration.playlists import PlaylistService
+from music_bot.application.orchestration.track_service import TrackService
+from music_bot.application.ports.track_source import (
+    TrackMetadata,
+    TrackSource,
+    TrackSourceError,
+)
 from music_bot.domain.music.models import GuildPlayback
+from music_bot.domain.playlists.models import PlaylistAccess
 
 
-class HangingResolver:
+class HangingTrackSource(TrackSource):
     def __init__(self) -> None:
         self.started: asyncio.Event = asyncio.Event()
 
-    async def resolve(self, *, source_url: str) -> TrackMetadata:
+    async def validate_url(self, *, source_url: str) -> TrackSource:
+        return self
+
+    async def _resolve_metadata(self, *, source_url: str) -> TrackMetadata:
         self.started.set()
         await asyncio.sleep(10)
-        raise AssertionError("resolve() should have been abandoned")
+        raise AssertionError("metadata resolution should have been abandoned")
+
+    async def _resolve_stream(self, *, source_url: str) -> str:
+        raise AssertionError("stream resolution is not expected")
+
+
+async def _create_playlist(
+    *,
+    playlist_service: PlaylistService,
+    fake_track_source: FakeTrackSource,
+    tracks: list[tuple[str, str]],
+) -> str:
+    playlist = await playlist_service.create(
+        owner_id=1,
+        owner_username="owner",
+        title="Playlist",
+        access=PlaylistAccess.PRIVATE,
+    )
+    for url, title in tracks:
+        fake_track_source.set_metadata(url, title=title)
+        await playlist_service.add_track(
+            playlist_id=playlist.id,
+            requested_by=1,
+            url=url,
+        )
+    return playlist.id
 
 
 @pytest.mark.unit
@@ -82,6 +128,7 @@ class TestPlayUrl:
         running_actor: GuildPlaybackActor,
         fake_player: FakeGuildPlayer,
         fake_track_source: FakeTrackSource,
+        fake_uow_factory: FakeUoWFactory,
         playback_repository: InMemoryGuildPlaybackRepository,
         make_play_url_command: MakePlayUrlCommand,
     ) -> None:
@@ -89,12 +136,15 @@ class TestPlayUrl:
             "https://example.com/a.mp3", title="Song A", duration_seconds=180
         )
         command: PlayUrlCommand = make_play_url_command(url="https://example.com/a.mp3")
+        uow_count_before_play: int = len(fake_uow_factory.uows)
 
         result: PlayUrlResult = cast(PlayUrlResult, await running_actor.execute(command))
 
         assert result.track.title == "Song A"
         assert result.queue_size == 1
         assert fake_player.play_calls == [("https://example.com/a.mp3", 100)]
+        assert len(fake_uow_factory.uows) == uow_count_before_play + 1
+        assert fake_uow_factory.uows[-1].commit_calls == 1
 
         saved: GuildPlayback | None = await playback_repository.get(guild_id=running_actor.guild_id)
         assert saved is not None
@@ -126,9 +176,9 @@ class TestPlayUrl:
         terminated_guild_ids: list[int],
         make_play_url_command: MakePlayUrlCommand,
     ) -> None:
-        fake_track_source.fail_resolve_with(TrackMetadataResolutionError("no such video"))
+        fake_track_source.fail_resolve_with(TrackSourceError("no such video"))
 
-        with pytest.raises(TrackMetadataResolutionError):
+        with pytest.raises(TrackSourceError):
             await running_actor.execute(make_play_url_command())
 
         assert terminated_guild_ids == [running_actor.guild_id]
@@ -140,20 +190,24 @@ class TestPlayUrl:
         terminated_guild_ids: list[int],
         make_play_url_command: MakePlayUrlCommand,
         monkeypatch: pytest.MonkeyPatch,
+        fake_uow_factory: FakeUoWFactory,
+        playlist_service: PlaylistService,
     ) -> None:
-        monkeypatch.setattr(play_url_module, "_RESOLVE_TIMEOUT_SECONDS", 0.05)
+        monkeypatch.setattr(PlayUrlCommandHandler, "_RESOLVE_TIMEOUT_SECONDS", 0.05)
+        resolver = HangingTrackSource()
         actor = GuildPlaybackActor(
-            guild_id=1,
-            playback=None,
+            playback=GuildPlayback(guild_id=1),
             playback_repository=playback_repository,
             player=fake_player,
-            metadata_resolver=HangingResolver(),
+            playlist_service=playlist_service,
+            track_service=TrackService(source=resolver),
+            uow_factory=fake_uow_factory,
             terminated_callback=lambda a: terminated_guild_ids.append(a.guild_id),
         )
         actor.start()
 
         try:
-            with pytest.raises(TrackMetadataResolutionError):
+            with pytest.raises(TrackSourceError):
                 await asyncio.wait_for(actor.execute(make_play_url_command()), timeout=1)
         finally:
             await actor.close()
@@ -163,19 +217,52 @@ class TestPlayUrl:
 
 @pytest.mark.unit
 class TestPlayPlaylist:
+    async def test_empty_playlist_returns_without_persisting_empty_playback(
+        self,
+        running_actor: GuildPlaybackActor,
+        playlist_service: PlaylistService,
+        terminated_guild_ids: list[int],
+        playback_repository: InMemoryGuildPlaybackRepository,
+    ) -> None:
+        playlist = await playlist_service.create(
+            owner_id=1,
+            owner_username="owner",
+            title="Empty",
+            access=PlaylistAccess.PRIVATE,
+        )
+
+        result = await running_actor.execute(
+            PlayPlaylistCommand(
+                guild_id=running_actor.guild_id,
+                requested_by=1,
+                playlist_id=playlist.id,
+            )
+        )
+
+        assert result.queued_count == 0
+        assert terminated_guild_ids == [running_actor.guild_id]
+        assert await playback_repository.get(guild_id=running_actor.guild_id) is None
+
     async def test_fresh_actor_batch_activates_and_starts_playback(
         self,
         running_actor: GuildPlaybackActor,
         fake_player: FakeGuildPlayer,
         fake_track_source: FakeTrackSource,
         playback_repository: InMemoryGuildPlaybackRepository,
+        playlist_service: PlaylistService,
     ) -> None:
-        fake_track_source.set_metadata("https://example.com/a.mp3", title="Song A")
-        fake_track_source.set_metadata("https://example.com/b.mp3", title="Song B")
+        playlist_id: str = await _create_playlist(
+            playlist_service=playlist_service,
+            fake_track_source=fake_track_source,
+            tracks=[
+                ("https://example.com/a.mp3", "Song A"),
+                ("https://example.com/b.mp3", "Song B"),
+            ],
+        )
         command = PlayPlaylistCommand(
             guild_id=running_actor.guild_id,
             requested_by=1,
-            urls=["https://example.com/a.mp3", "https://example.com/b.mp3"],
+            playlist_id=playlist_id,
         )
 
         result: PlayPlaylistResult = cast(PlayPlaylistResult, await running_actor.execute(command))
@@ -195,22 +282,67 @@ class TestPlayPlaylist:
         fake_player: FakeGuildPlayer,
         fake_track_source: FakeTrackSource,
         make_play_url_command: MakePlayUrlCommand,
+        playlist_service: PlaylistService,
     ) -> None:
         fake_track_source.set_metadata("https://example.com/a.mp3", title="Song A")
-        fake_track_source.set_metadata("https://example.com/b.mp3", title="Song B")
-        fake_track_source.set_metadata("https://example.com/c.mp3", title="Song C")
         await running_actor.execute(make_play_url_command(url="https://example.com/a.mp3"))
+        playlist_id: str = await _create_playlist(
+            playlist_service=playlist_service,
+            fake_track_source=fake_track_source,
+            tracks=[
+                ("https://example.com/b.mp3", "Song B"),
+                ("https://example.com/c.mp3", "Song C"),
+            ],
+        )
 
         command = PlayPlaylistCommand(
             guild_id=running_actor.guild_id,
             requested_by=1,
-            urls=["https://example.com/b.mp3", "https://example.com/c.mp3"],
+            playlist_id=playlist_id,
         )
         result: PlayPlaylistResult = cast(PlayPlaylistResult, await running_actor.execute(command))
 
         assert result.queued_count == 2
         assert result.started_playing is False
         assert fake_player.play_calls == [("https://example.com/a.mp3", 100)]
+
+    async def test_failure_after_first_track_preserves_partial_queue(
+        self,
+        running_actor: GuildPlaybackActor,
+        fake_player: FakeGuildPlayer,
+        fake_track_source: FakeTrackSource,
+        fake_uow_factory: FakeUoWFactory,
+        playback_repository: InMemoryGuildPlaybackRepository,
+        playlist_service: PlaylistService,
+        terminated_guild_ids: list[int],
+    ) -> None:
+        first_url = "https://example.com/first.mp3"
+        broken_url = "https://example.com/broken.mp3"
+        playlist_id: str = await _create_playlist(
+            playlist_service=playlist_service,
+            fake_track_source=fake_track_source,
+            tracks=[
+                (first_url, "First"),
+                (broken_url, "Broken"),
+            ],
+        )
+        fake_uow_factory.track_repository.forget(broken_url)
+        fake_track_source.fail_resolve_with(TrackSourceError("broken track"))
+
+        with pytest.raises(TrackSourceError, match="broken track"):
+            await running_actor.execute(
+                PlayPlaylistCommand(
+                    guild_id=running_actor.guild_id,
+                    requested_by=1,
+                    playlist_id=playlist_id,
+                )
+            )
+
+        saved = await playback_repository.get(guild_id=running_actor.guild_id)
+        assert saved is not None
+        assert [track.url for track in saved.tracks] == [first_url]
+        assert fake_player.play_calls == [(first_url, 100)]
+        assert terminated_guild_ids == []
 
 
 @pytest.mark.unit
@@ -242,6 +374,27 @@ class TestSkip:
         saved: GuildPlayback | None = await playback_repository.get(guild_id=running_actor.guild_id)
         assert saved is not None
         assert saved.track_count == 1
+
+    async def test_skip_resumes_paused_playback(
+        self,
+        running_actor: GuildPlaybackActor,
+        fake_track_source: FakeTrackSource,
+        playback_repository: InMemoryGuildPlaybackRepository,
+        make_play_url_command: MakePlayUrlCommand,
+        make_skip_command: MakeSkipCommand,
+    ) -> None:
+        fake_track_source.set_metadata("https://example.com/a.mp3", title="Song A")
+        fake_track_source.set_metadata("https://example.com/b.mp3", title="Song B")
+        await running_actor.execute(make_play_url_command(url="https://example.com/a.mp3"))
+        await running_actor.execute(make_play_url_command(url="https://example.com/b.mp3"))
+        await running_actor.execute(PauseCommand(guild_id=running_actor.guild_id, requested_by=1))
+
+        await running_actor.execute(make_skip_command(guild_id=running_actor.guild_id))
+
+        saved = await playback_repository.get(guild_id=running_actor.guild_id)
+        assert saved is not None
+        assert saved.is_paused is False
+        assert saved.first_track.title == "Song B"
 
     async def test_skip_last_track_reports_no_now_playing(
         self,
@@ -287,6 +440,69 @@ class TestStop:
         saved: GuildPlayback | None = await playback_repository.get(guild_id=running_actor.guild_id)
         assert saved is None
         assert terminated_guild_ids == [running_actor.guild_id]
+
+
+@pytest.mark.unit
+class TestPlaybackState:
+    async def test_state_commands_update_domain_and_apply_player_effects(
+        self,
+        running_actor: GuildPlaybackActor,
+        fake_player: FakeGuildPlayer,
+        fake_track_source: FakeTrackSource,
+        playback_repository: InMemoryGuildPlaybackRepository,
+        make_play_url_command: MakePlayUrlCommand,
+    ) -> None:
+        fake_track_source.set_metadata("https://example.com/a.mp3", title="Song A")
+        await running_actor.execute(make_play_url_command())
+
+        paused = await running_actor.execute(
+            PauseCommand(guild_id=running_actor.guild_id, requested_by=1)
+        )
+        resumed = await running_actor.execute(
+            ResumeCommand(guild_id=running_actor.guild_id, requested_by=1)
+        )
+        volume = await running_actor.execute(
+            SetVolumeCommand(guild_id=running_actor.guild_id, requested_by=1, volume=40)
+        )
+        loop = await running_actor.execute(
+            SetLoopCommand(guild_id=running_actor.guild_id, requested_by=1, enabled=True)
+        )
+
+        assert paused == PauseResult(paused=True)
+        assert resumed == ResumeResult(resumed=True)
+        assert volume == SetVolumeResult(volume=40)
+        assert loop == SetLoopResult(enabled=True)
+        assert fake_player.pause_calls == 1
+        assert fake_player.resume_calls == 1
+        assert fake_player.volume_calls == [40]
+
+        saved = await playback_repository.get(guild_id=running_actor.guild_id)
+        assert saved is not None
+        assert saved.is_paused is False
+        assert saved.volume == 40
+        assert saved.loop_current is True
+
+    async def test_queries_read_the_same_domain_state(
+        self,
+        running_actor: GuildPlaybackActor,
+        fake_track_source: FakeTrackSource,
+        make_play_url_command: MakePlayUrlCommand,
+    ) -> None:
+        fake_track_source.set_metadata("https://example.com/a.mp3", title="Song A")
+        await running_actor.execute(make_play_url_command())
+
+        queue = await running_actor.execute(
+            GetQueueCommand(guild_id=running_actor.guild_id, requested_by=1)
+        )
+        now_playing = await running_actor.execute(
+            NowPlayingCommand(guild_id=running_actor.guild_id, requested_by=1)
+        )
+
+        assert isinstance(queue, GetQueueResult)
+        assert [track.title for track in queue.tracks] == ["Song A"]
+        assert isinstance(now_playing, NowPlayingResult)
+        assert now_playing.track.title == "Song A"
+        assert now_playing.is_paused is False
 
 
 @pytest.mark.unit
@@ -380,19 +596,19 @@ class TestClose:
         playback_repository: InMemoryGuildPlaybackRepository,
         terminated_guild_ids: list[int],
         make_play_url_command: MakePlayUrlCommand,
+        fake_uow_factory: FakeUoWFactory,
+        playlist_service: PlaylistService,
     ) -> None:
-        # shutdown() closes every actor concurrently without going through
-        # the per-guild lock that normally keeps close() from overlapping an
-        # in-flight execute() — so a command can genuinely be mid-processing
-        # when close() lands. Without special handling that future is never
-        # resolved and whoever called execute() hangs forever.
-        resolver = HangingResolver()
+        # Lifecycle removal can close an actor while a command is in flight.
+        # The command future must still be resolved instead of orphaned.
+        resolver = HangingTrackSource()
         actor = GuildPlaybackActor(
-            guild_id=1,
-            playback=None,
+            playback=GuildPlayback(guild_id=1),
             playback_repository=playback_repository,
             player=fake_player,
-            metadata_resolver=resolver,
+            playlist_service=playlist_service,
+            track_service=TrackService(source=resolver),
+            uow_factory=fake_uow_factory,
             terminated_callback=lambda a: terminated_guild_ids.append(a.guild_id),
         )
         actor.start()

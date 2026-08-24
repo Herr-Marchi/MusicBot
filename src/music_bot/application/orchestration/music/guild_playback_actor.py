@@ -10,19 +10,23 @@ from typing import cast
 
 from music_bot.application.contracts.commands.music import (
     PlaybackCommand,
-    PlayPlaylistCommand,
-    PlayUrlCommand,
 )
-from music_bot.application.contracts.results.music import PlaybackResult, PlayPlaylistResult
+from music_bot.application.contracts.results.music import PlaybackResult
+from music_bot.application.orchestration.playlists import PlaylistService
+from music_bot.application.orchestration.track_service import TrackService
 from music_bot.application.ports.music import GuildPlaybackRepository
-from music_bot.application.ports.music_player import GuildPlayer, TrackFinishedCallback
-from music_bot.application.ports.track_source import TrackMetadataResolver
+from music_bot.application.ports.music_player import (
+    GuildPlayer,
+    PlaybackSettings,
+    TrackFinishedCallback,
+)
+from music_bot.application.ports.uow import UoWFactory
 from music_bot.domain.music.models import GuildPlayback, Track
 
 from .command_handlers import PlaybackCommandDispatcher
 from .event_listeners import TrackFinishedEventListener
 from .events import TrackFinishedEvent
-from .handlers import HandlerOutcome, PlayUrlCommandHandler, PlayUrlHandling
+from .handlers import HandlerOutcome
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -40,44 +44,56 @@ class GuildPlaybackActor:
     def __init__(
         self,
         *,
-        guild_id: int,
-        playback: GuildPlayback | None,
+        playback: GuildPlayback,
         playback_repository: GuildPlaybackRepository,
         player: GuildPlayer,
-        metadata_resolver: TrackMetadataResolver,
+        playlist_service: PlaylistService,
+        track_service: TrackService,
+        uow_factory: UoWFactory,
         terminated_callback: Callable[[GuildPlaybackActor], None],
     ) -> None:
-        self._guild_id: int = guild_id
-        self._playback: GuildPlayback | None = playback
+        self._playback: GuildPlayback = playback
         self._playback_repository: GuildPlaybackRepository = playback_repository
         self._player: GuildPlayer = player
         self._terminated_callback: Callable[[GuildPlaybackActor], None] = terminated_callback
-        self._play_url_handler: PlayUrlCommandHandler = PlayUrlCommandHandler(
-            metadata_resolver=metadata_resolver
+        self._command_dispatcher: PlaybackCommandDispatcher = PlaybackCommandDispatcher(
+            playback=playback,
+            player=player,
+            playlist_service=playlist_service,
+            track_service=track_service,
+            uow_factory=uow_factory,
+            start_playback=self._start_playback_if_needed,
         )
-        self._command_dispatcher: PlaybackCommandDispatcher | None = None
-        self._track_finished_listener: TrackFinishedEventListener | None = None
-        if playback is not None:
-            self._activate(playback=playback)
+        self._track_finished_listener: TrackFinishedEventListener = TrackFinishedEventListener(
+            playback=playback
+        )
         self._mailbox: asyncio.Queue[ActorMessage] = asyncio.Queue()
         self._task: asyncio.Task[None] | None = None
         self._finished_callback: TrackFinishedCallback | None = None
 
     @property
     def guild_id(self) -> int:
-        return self._guild_id
+        return self._playback.guild_id
 
     def start(self) -> None:
         if self._task is not None:
             raise RuntimeError("GuildPlaybackActor is already running")
 
+        logger.info(
+            "Playback actor starting guild_id=%s queue_size=%s paused=%s",
+            self.guild_id,
+            self._playback.track_count,
+            self._playback.is_paused,
+        )
         self._task = asyncio.create_task(self._run())
 
     async def close(self) -> None:
         task: asyncio.Task[None] | None = self._task
         if task is None:
+            logger.debug("Playback actor close skipped guild_id=%s state=stopped", self.guild_id)
             return
 
+        logger.info("Playback actor closing guild_id=%s", self.guild_id)
         task.cancel()
         with suppress(asyncio.CancelledError):
             await task
@@ -87,15 +103,28 @@ class GuildPlaybackActor:
         self._reject_pending_messages(RuntimeError("GuildPlaybackActor stopped"))
         self._finished_callback = None
         await self._player.stop()
+        logger.info("Playback actor closed guild_id=%s", self.guild_id)
 
     async def execute[ResultT: PlaybackResult](self, command: PlaybackCommand[ResultT]) -> ResultT:
+        return await self.submit(command)
+
+    def submit[ResultT: PlaybackResult](
+        self,
+        command: PlaybackCommand[ResultT],
+    ) -> Future[ResultT]:
         self._ensure_running()
         if command.guild_id != self.guild_id:
             raise ValueError("Command guild does not match GuildPlaybackActor guild")
 
         future: asyncio.Future[PlaybackResult] = asyncio.get_running_loop().create_future()
-        await self._mailbox.put(CommandMessage(command=command, future=future))
-        return cast(ResultT, await future)
+        self._mailbox.put_nowait(CommandMessage(command=command, future=future))
+        logger.debug(
+            "Playback command queued guild_id=%s command=%s mailbox_size=%s",
+            self.guild_id,
+            type(command).__name__,
+            self._mailbox.qsize(),
+        )
+        return cast(Future[ResultT], future)
 
     def _ensure_running(self) -> None:
         if self._task is None:
@@ -108,15 +137,18 @@ class GuildPlaybackActor:
         exception: Exception | None,
     ) -> None:
         if self._task is not None:
+            logger.debug(
+                "Track finished callback published guild_id=%s title=%r has_error=%s",
+                self.guild_id,
+                track.title,
+                exception is not None,
+            )
             self._mailbox.put_nowait(
-                TrackFinishedEvent(
-                    track=track,
-                    callback=callback,
-                    exception=exception,
-                )
+                TrackFinishedEvent(track=track, callback=callback, exception=exception)
             )
 
     async def _run(self) -> None:
+        logger.debug("Playback actor mailbox loop started guild_id=%s", self.guild_id)
         try:
             while True:
                 message: ActorMessage = await self._mailbox.get()
@@ -132,141 +164,105 @@ class GuildPlaybackActor:
                     raise
                 except Exception as exc:
                     if isinstance(message, CommandMessage):
+                        logger.warning(
+                            "Playback command failed inside actor guild_id=%s command=%s "
+                            "error_type=%s",
+                            self.guild_id,
+                            type(message.command).__name__,
+                            type(exc).__name__,
+                        )
                         if not message.future.done():
                             message.future.set_exception(exc)
                     else:
-                        logger.exception(
-                            "Unhandled exception in guild %s playback actor",
-                            self.guild_id,
-                        )
+                        logger.exception("Unhandled playback event in guild %s", self.guild_id)
                 finally:
                     self._mailbox.task_done()
 
-                if self._playback is None or self._playback.track_count == 0:
+                if self._playback.track_count == 0:
+                    logger.info("Playback actor reached empty queue guild_id=%s", self.guild_id)
                     self._reject_pending_messages(RuntimeError("GuildPlaybackActor playback ended"))
                     self._terminated_callback(self)
                     return
         finally:
             self._task = None
+            logger.debug("Playback actor mailbox loop stopped guild_id=%s", self.guild_id)
 
     async def _execute_command(self, message: CommandMessage) -> None:
-        result: PlaybackResult
-        match message.command:
-            case PlayUrlCommand():
-                result = await self._play_url(message.command)
-            case PlayPlaylistCommand():
-                result = await self._play_playlist(message.command)
-            case _:
-                playback, command_dispatcher = self._require_playback()
-                outcome: HandlerOutcome[PlaybackResult] = await command_dispatcher.handle(
-                    message.command
-                )
+        outcome: HandlerOutcome[PlaybackResult] | None = None
+        command_name: str = type(message.command).__name__
+        logger.debug(
+            "Playback actor executing command guild_id=%s command=%s queue_size=%s",
+            self.guild_id,
+            command_name,
+            self._playback.track_count,
+        )
+        try:
+            outcome = await self._command_dispatcher.handle(message.command)
+            if outcome.interrupts_current_track:
+                self._finished_callback = None
+            if outcome.restart_playback and self._playback.track_count > 0:
+                await self._start_playback_if_needed()
+        finally:
+            if outcome is None or outcome.mutated:
+                await self._persist()
 
-                if outcome.interrupts_current_track:
-                    self._finished_callback = None
-
-                if outcome.mutated:
-                    try:
-                        if outcome.restart_playback and playback.track_count > 0:
-                            await self._start_playback_if_needed()
-                    finally:
-                        await self._persist()
-
-                result = outcome.result
-
+        logger.debug(
+            "Playback actor command completed guild_id=%s command=%s queue_size=%s "
+            "paused=%s volume=%s loop=%s",
+            self.guild_id,
+            command_name,
+            self._playback.track_count,
+            self._playback.is_paused,
+            self._playback.volume,
+            self._playback.loop_current,
+        )
         if not message.future.done():
-            message.future.set_result(result)
-
-    async def _play_url(self, command: PlayUrlCommand) -> PlaybackResult:
-        try:
-            if self._playback is not None:
-                await self._start_playback_if_needed()
-
-            handling: PlayUrlHandling = await self._play_url_handler.handle(
-                command,
-                playback=self._playback,
-            )
-            if self._playback is None:
-                self._activate(playback=handling.playback)
-
-            await self._start_playback_if_needed()
-            return handling.result
-        finally:
-            if self._playback is not None:
-                await self._persist()
-
-    async def _play_playlist(self, command: PlayPlaylistCommand) -> PlayPlaylistResult:
-        # One mailbox message for the whole batch — not N separate
-        # execute() calls from outside — so this is genuinely atomic with
-        # respect to any other command for this guild (e.g. a concurrent
-        # /skip can't land in the middle of it), and persists once at the
-        # end instead of once per track.
-        queued_count: int = 0
-        started_playing: bool = False
-        try:
-            for url in command.urls:
-                if self._playback is not None:
-                    await self._start_playback_if_needed()
-
-                handling: PlayUrlHandling = await self._play_url_handler.handle(
-                    PlayUrlCommand(
-                        guild_id=command.guild_id,
-                        url=url,
-                        requested_by=command.requested_by,
-                    ),
-                    playback=self._playback,
-                )
-                if self._playback is None:
-                    self._activate(playback=handling.playback)
-
-                await self._start_playback_if_needed()
-                queued_count += 1
-                started_playing = started_playing or handling.result.queue_size == 1
-        finally:
-            if self._playback is not None:
-                await self._persist()
-
-        return PlayPlaylistResult(queued_count=queued_count, started_playing=started_playing)
+            message.future.set_result(outcome.result)
 
     async def _track_finished(self, event: TrackFinishedEvent) -> None:
-        playback: GuildPlayback | None = self._playback
         if (
             event.callback is not self._finished_callback
-            or playback is None
-            or playback.track_count == 0
-            or playback.first_track is not event.track
+            or self._playback.current_track is not event.track
         ):
+            logger.debug(
+                "Stale track finished event ignored guild_id=%s title=%r",
+                self.guild_id,
+                event.track.title,
+            )
             return
 
+        logger.info(
+            "Track finished event handling guild_id=%s title=%r has_error=%s",
+            self.guild_id,
+            event.track.title,
+            event.exception is not None,
+        )
         self._finished_callback = None
-        listener: TrackFinishedEventListener | None = self._track_finished_listener
-        if listener is None:
-            raise RuntimeError("GuildPlaybackActor has no track-finished listener")
-
         try:
-            has_tracks: bool = listener.handle(event)
-            if has_tracks:
+            if self._track_finished_listener.handle(event):
                 await self._start_playback_if_needed()
         finally:
             await self._persist()
 
     async def _start_playback_if_needed(self) -> None:
-        if self._finished_callback is not None:
+        if self._finished_callback is not None or self._playback.track_count == 0:
+            logger.debug(
+                "Playback start skipped guild_id=%s callback_active=%s queue_size=%s",
+                self.guild_id,
+                self._finished_callback is not None,
+                self._playback.track_count,
+            )
             return
 
-        playback, _ = self._require_playback()
-        try:
-            self._finished_callback = await self._start_playback(playback=playback)
-            if playback.is_paused:
-                await self._player.pause()
-        except Exception:
-            self._finished_callback = None
-            playback.clear()
-            await self._player.stop()
-            raise
-
-    async def _start_playback(self, *, playback: GuildPlayback) -> TrackFinishedCallback:
-        track: Track = playback.first_track
+        track: Track = self._playback.first_track
+        logger.info(
+            "Playback start requested guild_id=%s title=%r queue_size=%s paused=%s volume=%s",
+            self.guild_id,
+            track.title,
+            self._playback.track_count,
+            self._playback.is_paused,
+            self._playback.volume,
+        )
         loop: asyncio.AbstractEventLoop = asyncio.get_running_loop()
 
         def on_finished(exception: Exception | None) -> None:
@@ -277,44 +273,52 @@ class GuildPlaybackActor:
                 exception,
             )
 
-        await self._player.play(
-            url=track.url,
-            volume=playback.volume,
-            on_finished=on_finished,
-        )
-        return on_finished
+        def current_settings() -> PlaybackSettings:
+            return PlaybackSettings(
+                volume=self._playback.volume,
+                is_paused=self._playback.is_paused,
+            )
+
+        try:
+            await self._player.play(
+                url=track.url,
+                settings=current_settings,
+                on_finished=on_finished,
+            )
+            self._finished_callback = on_finished
+            logger.debug(
+                "Playback start delegated to player guild_id=%s title=%r",
+                self.guild_id,
+                track.title,
+            )
+        except Exception:
+            logger.exception(
+                "Playback start delegation failed guild_id=%s title=%r",
+                self.guild_id,
+                track.title,
+            )
+            self._finished_callback = None
+            self._playback.clear()
+            await self._player.stop()
+            raise
 
     async def _persist(self) -> None:
-        playback, _ = self._require_playback()
-        if playback.track_count == 0:
+        if self._playback.track_count == 0:
+            logger.debug("Deleting empty playback state guild_id=%s", self.guild_id)
             await self._playback_repository.delete(guild_id=self.guild_id)
         else:
-            await self._playback_repository.save(playback=playback)
-
-    def _require_playback(
-        self,
-    ) -> tuple[GuildPlayback, PlaybackCommandDispatcher]:
-        if self._playback is None or self._command_dispatcher is None:
-            raise RuntimeError("GuildPlaybackActor has not been activated")
-
-        return self._playback, self._command_dispatcher
-
-    def _create_command_dispatcher(
-        self,
-        *,
-        playback: GuildPlayback,
-    ) -> PlaybackCommandDispatcher:
-        return PlaybackCommandDispatcher(
-            playback=playback,
-            player=self._player,
-        )
-
-    def _activate(self, *, playback: GuildPlayback) -> None:
-        self._playback = playback
-        self._command_dispatcher = self._create_command_dispatcher(playback=playback)
-        self._track_finished_listener = TrackFinishedEventListener(playback=playback)
+            logger.debug(
+                "Saving playback state guild_id=%s queue_size=%s paused=%s volume=%s loop=%s",
+                self.guild_id,
+                self._playback.track_count,
+                self._playback.is_paused,
+                self._playback.volume,
+                self._playback.loop_current,
+            )
+            await self._playback_repository.save(playback=self._playback)
 
     def _reject_pending_messages(self, stop_exception: Exception) -> None:
+        rejected_count: int = 0
         while True:
             try:
                 message: ActorMessage = self._mailbox.get_nowait()
@@ -323,4 +327,12 @@ class GuildPlaybackActor:
 
             if isinstance(message, CommandMessage) and not message.future.done():
                 message.future.set_exception(stop_exception)
+                rejected_count += 1
             self._mailbox.task_done()
+        if rejected_count:
+            logger.info(
+                "Pending playback commands rejected guild_id=%s count=%s reason=%s",
+                self.guild_id,
+                rejected_count,
+                stop_exception,
+            )

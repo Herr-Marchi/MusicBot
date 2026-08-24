@@ -1,184 +1,190 @@
 from __future__ import annotations
 
-import socket
-from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from yt_dlp.utils import DownloadError
 
-from music_bot.adapters.outbound.yt_dlp.youtube import YtDlpTrackSource, ensure_safe_track_url
-from music_bot.application.contracts.errors import TrackMetadataResolutionError
+from music_bot.adapters.outbound.url_safety import UnsafeUrlError
+from music_bot.adapters.outbound.yt_dlp.youtube import YtDlpTrackSource
+from music_bot.application.ports.track_source import TrackNotOwnedError, TrackSourceError
+
+
+@pytest.fixture
+def allow_safe_url(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+    check = AsyncMock()
+    monkeypatch.setattr(
+        "music_bot.adapters.outbound.yt_dlp.youtube.ensure_safe_url",
+        check,
+    )
+    return check
 
 
 @pytest.mark.unit
-class TestEnsureSafeTrackUrl:
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "file:///etc/passwd",
-            "ftp://example.com/file",
-            "javascript:alert(1)",
-            "",
-        ],
-    )
-    def test_rejects_disallowed_scheme(self, url: str) -> None:
-        with pytest.raises(TrackMetadataResolutionError):
-            ensure_safe_track_url(url)
-
-    def test_rejects_url_with_no_host(self) -> None:
-        with pytest.raises(TrackMetadataResolutionError):
-            ensure_safe_track_url("https:///no-host-here")
-
-    @pytest.mark.parametrize(
-        "url",
-        [
-            "http://127.0.0.1/",
-            "http://127.0.0.1:8080/admin",
-            "http://[::1]/",
-            "http://169.254.169.254/latest/meta-data/",  # cloud metadata service
-            "http://10.0.0.5/",
-            "http://172.16.0.1/",
-            "http://192.168.1.1/",
-            "http://0.0.0.0/",
-        ],
-    )
-    def test_rejects_literal_unsafe_addresses(self, url: str) -> None:
-        with pytest.raises(TrackMetadataResolutionError):
-            ensure_safe_track_url(url)
-
-    def test_allows_literal_public_address(self) -> None:
-        ensure_safe_track_url("http://93.184.216.34/")
-
-    def test_rejects_hostname_resolving_to_private_address(
-        self, monkeypatch: pytest.MonkeyPatch
+class TestYtDlpTrackSource:
+    async def test_resolve_metadata_maps_yt_dlp_result(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
     ) -> None:
-        def fake_getaddrinfo(host: str, port: object, *args: object, **kwargs: object) -> Any:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 0))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
-        with pytest.raises(TrackMetadataResolutionError):
-            ensure_safe_track_url("http://internal.example.test/")
-
-    def test_allows_hostname_resolving_to_public_address(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        def fake_getaddrinfo(host: str, port: object, *args: object, **kwargs: object) -> Any:
-            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", 0))]
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
-        ensure_safe_track_url("http://public.example.test/")
-
-    def test_rejects_hostname_that_does_not_resolve(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        def fake_getaddrinfo(host: str, port: object, *args: object, **kwargs: object) -> Any:
-            raise socket.gaierror("Name or service not known")
-
-        monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
-
-        with pytest.raises(TrackMetadataResolutionError):
-            ensure_safe_track_url("http://does-not-resolve.example.test/")
-
-
-@pytest.mark.unit
-class TestYtDlpTrackSourceErrorMessages:
-    async def test_download_error_does_not_leak_internal_detail_to_caller(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        sensitive_detail: str = "Connection refused to 10.0.0.5:8080 - internal-admin-panel"
-
-        fake_ydl = MagicMock()
-        fake_ydl.__enter__.return_value.extract_info.side_effect = DownloadError(sensitive_detail)
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.return_value = {
+            "webpage_url": "https://www.youtube.com/watch?v=id",
+            "title": "Song",
+            "duration": 123,
+        }
         monkeypatch.setattr(
             "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
-            MagicMock(return_value=fake_ydl),
+            MagicMock(return_value=youtube_dl),
         )
 
-        source = YtDlpTrackSource()
-        with pytest.raises(TrackMetadataResolutionError) as exc_info:
-            await source.resolve(source_url="http://example.com/track")
+        metadata = await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+
+        assert metadata.url == "https://www.youtube.com/watch?v=id"
+        assert metadata.title == "Song"
+        assert metadata.duration_seconds == 123
+        assert allow_safe_url.await_args_list == [
+            (("https://youtu.be/id",), {}),
+            (("https://www.youtube.com/watch?v=id",), {}),
+        ]
+
+    async def test_resolve_stream_returns_direct_url(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.return_value = {
+            "url": "https://cdn.googlevideo.com/audio"
+        }
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            MagicMock(return_value=youtube_dl),
+        )
+
+        stream_url = await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+
+        assert stream_url == "https://cdn.googlevideo.com/audio"
+        assert allow_safe_url.await_args_list == [
+            (("https://youtu.be/id",), {}),
+            (("https://cdn.googlevideo.com/audio",), {}),
+        ]
+
+    async def test_rejects_non_youtube_url_before_safety_check(
+        self, allow_safe_url: AsyncMock
+    ) -> None:
+        with pytest.raises(TrackSourceError):
+            await YtDlpTrackSource().resolve_metadata(source_url="https://example.com/track")
+
+        allow_safe_url.assert_not_awaited()
+
+    async def test_rejects_host_allowlist_bypass_before_safety_check(
+        self, allow_safe_url: AsyncMock
+    ) -> None:
+        with pytest.raises(TrackNotOwnedError):
+            await YtDlpTrackSource().resolve_metadata(
+                source_url="https://youtube.com.attacker.test/watch?v=id"
+            )
+
+        allow_safe_url.assert_not_awaited()
+
+    async def test_unsafe_input_never_reaches_ytdlp(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        allow_safe_url.side_effect = UnsafeUrlError("unsafe")
+        youtube_dl_factory = MagicMock()
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            youtube_dl_factory,
+        )
+
+        with pytest.raises(TrackSourceError, match="unsafe"):
+            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+
+        youtube_dl_factory.assert_not_called()
+
+    async def test_rejects_unsupported_canonical_metadata_url(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.return_value = {
+            "webpage_url": "https://attacker.test/track",
+            "title": "Song",
+            "duration": 1,
+        }
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            MagicMock(return_value=youtube_dl),
+        )
+
+        with pytest.raises(TrackNotOwnedError):
+            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+
+        allow_safe_url.assert_awaited_once_with("https://youtu.be/id")
+
+    @pytest.mark.parametrize(
+        "stream_url",
+        [
+            "https://googlevideo.com.attacker.test/audio",
+            "https://evilgooglevideo.com/audio",
+            "https://attacker.test/googlevideo.com/audio",
+        ],
+    )
+    async def test_rejects_stream_host_allowlist_bypass(
+        self,
+        stream_url: str,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.return_value = {"url": stream_url}
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            MagicMock(return_value=youtube_dl),
+        )
+
+        with pytest.raises(TrackSourceError, match="stream URL is not supported"):
+            await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+
+        allow_safe_url.assert_awaited_once_with("https://youtu.be/id")
+
+    async def test_rejects_unsafe_allowed_stream_before_returning_it(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        stream_url = "https://cdn.googlevideo.com/audio"
+        allow_safe_url.side_effect = [None, UnsafeUrlError("private address")]
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.return_value = {"url": stream_url}
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            MagicMock(return_value=youtube_dl),
+        )
+
+        with pytest.raises(TrackSourceError, match="private address"):
+            await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+
+        assert allow_safe_url.await_count == 2
+
+    async def test_download_error_does_not_leak_internal_detail(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        allow_safe_url: AsyncMock,
+    ) -> None:
+        sensitive_detail = "Connection refused to 10.0.0.5:8080"
+        youtube_dl = MagicMock()
+        youtube_dl.__enter__.return_value.extract_info.side_effect = DownloadError(sensitive_detail)
+        monkeypatch.setattr(
+            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            MagicMock(return_value=youtube_dl),
+        )
+
+        with pytest.raises(TrackSourceError) as exc_info:
+            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
 
         assert sensitive_detail not in str(exc_info.value)
-        assert "10.0.0.5" not in str(exc_info.value)
-
-
-def _mock_youtube_dl(monkeypatch: pytest.MonkeyPatch, extract_info: Any) -> list[str]:
-    """Patches YoutubeDL so extract_info() is replaced by `extract_info`,
-    and returns the list its calls will be recorded into."""
-    captured_urls: list[str] = []
-
-    def recording_extract_info(url: str, download: bool) -> Any:
-        captured_urls.append(url)
-        return extract_info(url)
-
-    fake_ydl = MagicMock()
-    fake_ydl.__enter__.return_value.extract_info.side_effect = recording_extract_info
-    monkeypatch.setattr(
-        "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
-        MagicMock(return_value=fake_ydl),
-    )
-    return captured_urls
-
-
-@pytest.mark.unit
-class TestResolveSearchesInsteadOfFetchingDirectly:
-    async def test_resolve_wraps_input_as_a_youtube_search_query(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        captured_urls = _mock_youtube_dl(
-            monkeypatch,
-            lambda _url: {
-                "entries": [
-                    {
-                        "webpage_url": "https://www.youtube.com/watch?v=abc123",
-                        "title": "Never Gonna Give You Up",
-                        "duration": 213,
-                    }
-                ]
-            },
-        )
-
-        source = YtDlpTrackSource()
-        metadata = await source.resolve(source_url="never gonna give you up")
-
-        assert captured_urls == ["ytsearch1:never gonna give you up"]
-        assert metadata.source_url == "https://www.youtube.com/watch?v=abc123"
-        assert metadata.title == "Never Gonna Give You Up"
-
-    async def test_ssrf_shaped_input_is_treated_as_search_text_not_a_fetch_target(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        # A string that would be rejected outright by ensure_safe_track_url()
-        # if it were fetched as a URL must not be rejected here — resolve()
-        # never treats it as a URL at all, it's just the search query.
-        captured_urls = _mock_youtube_dl(monkeypatch, lambda _url: {"entries": []})
-
-        source = YtDlpTrackSource()
-        with pytest.raises(TrackMetadataResolutionError) as exc_info:
-            await source.resolve(source_url="http://169.254.169.254/latest/meta-data/")
-
-        assert captured_urls == ["ytsearch1:http://169.254.169.254/latest/meta-data/"]
-        assert "cannot be used" not in str(exc_info.value)  # not the URL-safety rejection
-        assert str(exc_info.value) == "No results found for that search."
-
-    async def test_no_search_results_raises_a_clear_error(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _mock_youtube_dl(monkeypatch, lambda _url: {"entries": []})
-
-        source = YtDlpTrackSource()
-        with pytest.raises(TrackMetadataResolutionError, match="No results found"):
-            await source.resolve(source_url="asdkjqwhekjqwhekjqhwekjqhwe")
-
-
-@pytest.mark.unit
-class TestResolveStreamStillValidatesTheUrl:
-    async def test_rejects_unsafe_resolved_url_before_fetching(self) -> None:
-        # resolve_stream() receives an already-resolved URL (from a prior
-        # resolve() call's canonical webpage_url) — it's the one path that
-        # still hands yt-dlp a real destination, so the host check applies.
-        source = YtDlpTrackSource()
-
-        with pytest.raises(TrackMetadataResolutionError):
-            await source.resolve_stream(source_url="http://169.254.169.254/latest/meta-data/")

@@ -4,10 +4,12 @@ from collections.abc import AsyncGenerator
 from typing import Protocol
 
 import pytest
-from tests.fakes import FakeGuildPlayer, FakeTrackSource
+from tests.fakes import FakeGuildPlayer, FakeUoWFactory
 
 from music_bot.adapters.outbound.in_memory.music import InMemoryGuildPlaybackRepository
 from music_bot.application.orchestration.music.guild_playback_actor import GuildPlaybackActor
+from music_bot.application.orchestration.playlists import PlaylistService
+from music_bot.application.orchestration.track_service import TrackService
 from music_bot.domain.music.models import GuildPlayback
 
 
@@ -36,9 +38,22 @@ def terminated_guild_ids() -> list[int]:
 
 
 @pytest.fixture
+def playlist_service(
+    fake_uow_factory: FakeUoWFactory,
+    track_service: TrackService,
+) -> PlaylistService:
+    return PlaylistService(
+        uow_factory=fake_uow_factory,
+        track_service=track_service,
+    )
+
+
+@pytest.fixture
 def make_actor(
     fake_player: FakeGuildPlayer,
-    fake_track_source: FakeTrackSource,
+    playlist_service: PlaylistService,
+    track_service: TrackService,
+    fake_uow_factory: FakeUoWFactory,
     playback_repository: InMemoryGuildPlaybackRepository,
     terminated_guild_ids: list[int],
 ) -> MakeActor:
@@ -51,11 +66,12 @@ def make_actor(
             terminated_guild_ids.append(actor.guild_id)
 
         return GuildPlaybackActor(
-            guild_id=guild_id,
-            playback=playback,
+            playback=playback or GuildPlayback(guild_id=guild_id),
             playback_repository=playback_repository,
             player=fake_player,
-            metadata_resolver=fake_track_source,
+            playlist_service=playlist_service,
+            track_service=track_service,
+            uow_factory=fake_uow_factory,
             terminated_callback=_terminated_callback,
         )
 

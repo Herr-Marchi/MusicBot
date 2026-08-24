@@ -22,7 +22,7 @@ class Settings(BaseSettings):
         alias="REDIS_PLAYBACK_TTL_SECONDS",
         gt=0,
     )
-    log_level: LogLevel = Field(default=LogLevel.INFO, alias="LOG_LEVEL")
+    log_level: LogLevel = Field(default=LogLevel.DEBUG, alias="LOG_LEVEL")
 
     @field_validator("discord_token")
     @classmethod

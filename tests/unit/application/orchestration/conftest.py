@@ -1,21 +1,23 @@
 from __future__ import annotations
 
 import pytest
-from tests.fakes import FakeTrackCatalog, FakeTrackSource
+from tests.fakes import FakeTrackRepository, FakeTrackSource, FakeUoWFactory
 
-from music_bot.application.orchestration.track_metadata_resolver import (
-    CatalogBackedTrackMetadataResolver,
-)
+from music_bot.application.orchestration.track_service import TrackService
 
 
 @pytest.fixture
-def fake_track_catalog() -> FakeTrackCatalog:
-    return FakeTrackCatalog()
+def fake_uow_factory() -> FakeUoWFactory:
+    return FakeUoWFactory()
 
 
 @pytest.fixture
-def resolver(
+def fake_track_repository(fake_uow_factory: FakeUoWFactory) -> FakeTrackRepository:
+    return fake_uow_factory.track_repository
+
+
+@pytest.fixture
+def track_service(
     fake_track_source: FakeTrackSource,
-    fake_track_catalog: FakeTrackCatalog,
-) -> CatalogBackedTrackMetadataResolver:
-    return CatalogBackedTrackMetadataResolver(inner=fake_track_source, catalog=fake_track_catalog)
+) -> TrackService:
+    return TrackService(source=fake_track_source)

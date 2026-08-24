@@ -34,5 +34,10 @@ def configure_logging(settings: Settings) -> None:
     root_logger.setLevel(level)
     root_logger.addHandler(handler)
 
-    logging.getLogger("discord").setLevel(logging.WARNING)
-    logging.getLogger("aiohttp").setLevel(logging.WARNING)
+    logging.getLogger("discord").setLevel(logging.INFO)
+    logging.getLogger("aiohttp").setLevel(logging.INFO)
+
+    logging.getLogger(__name__).debug(
+        "Logging configured root_level=%s discord_level=INFO aiohttp_level=INFO",
+        settings.log_level,
+    )

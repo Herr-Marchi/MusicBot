@@ -9,6 +9,7 @@ from discord.ext import commands
 from music_bot.adapters.inbound.discord.cogs.base import BaseCog
 from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 from music_bot.adapters.inbound.discord.helpers import InteractionContext, begin_interaction
+from music_bot.adapters.inbound.discord.voice_manager import VoiceConnectionLease
 from music_bot.application.contracts.commands.music import StopCommand
 from music_bot.application.contracts.errors import PlaybackNotActiveError
 from music_bot.application.contracts.results.music import StopResult
@@ -22,10 +23,12 @@ class VoiceCog(BaseCog, name="Voice"):
     @app_commands.command(name="join", description="Joins a voice channel")
     async def join(self, interaction: Interaction) -> None:
         ctx: InteractionContext = await begin_interaction(interaction)
-        voice_client: discord.VoiceClient = await self.deps.voice_manager.connect(
+        connection: VoiceConnectionLease = await self.deps.voice_manager.connect(
             guild=ctx.guild,
             member=ctx.member,
         )
+        connection.retain()
+        voice_client: discord.VoiceClient = connection.voice_client
         await ctx.responder.success(f"Connected to {voice_client.channel.mention}")
 
     @app_commands.command(name="leave", description="Stops playback and leaves voice")

@@ -5,10 +5,6 @@ class PlaybackNotActiveError(Exception):
     pass
 
 
-class TrackMetadataResolutionError(Exception):
-    pass
-
-
 class PlaylistNotFoundError(Exception):
     pass
 
@@ -21,5 +17,4 @@ __all__ = (
     "NotPlaylistOwnerError",
     "PlaybackNotActiveError",
     "PlaylistNotFoundError",
-    "TrackMetadataResolutionError",
 )

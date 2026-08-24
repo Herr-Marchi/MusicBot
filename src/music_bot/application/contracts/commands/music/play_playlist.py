@@ -10,6 +10,6 @@ from .base import PlaybackCommand
 
 
 class PlayPlaylistCommand(PlaybackCommand[PlayPlaylistResult]):
-    urls: list[str] = Field(..., min_length=1)
+    playlist_id: str = Field(..., min_length=1)
 
     creates_actor: ClassVar[bool] = True

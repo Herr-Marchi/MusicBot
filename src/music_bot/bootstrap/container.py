@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
 
@@ -13,34 +14,38 @@ from music_bot.adapters.inbound.discord.dependencies import DiscordDependencies
 from music_bot.adapters.inbound.discord.voice_manager import DiscordVoiceManager
 from music_bot.adapters.outbound.discord_player import DiscordGuildPlayerFactory
 from music_bot.adapters.outbound.postgres import (
-    PostgresPlaylistUoWFactory,
-    PostgresTrackCatalog,
+    PostgresUoWFactory,
     create_engine,
     create_session_factory,
 )
 from music_bot.adapters.outbound.redis import RedisGuildPlaybackRepository, create_redis_client
+from music_bot.adapters.outbound.track_source_router import TrackSourceRouter
 from music_bot.adapters.outbound.yt_dlp import YtDlpTrackSource
 from music_bot.application.orchestration.music import (
     GuildPlaybackActorManager,
     GuildPlaybackActorRegistry,
 )
 from music_bot.application.orchestration.playlists import PlaylistService
-from music_bot.application.orchestration.track_metadata_resolver import (
-    CatalogBackedTrackMetadataResolver,
-)
+from music_bot.application.orchestration.track_service import TrackService
 from music_bot.application.ports.music import GuildPlaybackRepository
 from music_bot.application.ports.music_player import GuildPlayerFactory
-from music_bot.application.ports.track_catalog import TrackCatalog
-from music_bot.application.ports.track_source import TrackMetadataResolver, TrackSource
+from music_bot.application.ports.track_source import (
+    TrackMetadataResolver,
+    TrackSource,
+    TrackStreamResolver,
+)
+from music_bot.application.ports.uow import UoWFactory
 
 from .settings import Settings
+
+logger: logging.Logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class Container:
     settings: Settings
     postgres_engine: AsyncEngine
-    playlist_uow_factory: PostgresPlaylistUoWFactory
+    postgres_uow_factory: PostgresUoWFactory
     redis_client: Redis
     playback_repository: GuildPlaybackRepository
     track_source: TrackSource
@@ -50,11 +55,12 @@ class Container:
 
     @classmethod
     def create(cls, *, settings: Settings) -> Container:
+        logger.debug("Creating application container")
         postgres_engine: AsyncEngine = cls._create_postgres_engine(settings=settings)
         postgres_session_factory: async_sessionmaker[AsyncSession] = (
             cls._create_postgres_session_factory(engine=postgres_engine)
         )
-        playlist_uow_factory: PostgresPlaylistUoWFactory = cls._create_playlist_uow_factory(
+        postgres_uow_factory: PostgresUoWFactory = cls._create_postgres_uow_factory(
             session_factory=postgres_session_factory
         )
 
@@ -64,11 +70,10 @@ class Container:
             settings=settings,
         )
         track_source: TrackSource = cls._create_track_source()
-        track_catalog: TrackCatalog = cls._create_track_catalog(
-            session_factory=postgres_session_factory
-        )
-        catalog_backed_metadata_resolver: TrackMetadataResolver = (
-            cls._create_catalog_backed_metadata_resolver(inner=track_source, catalog=track_catalog)
+        track_service: TrackService = cls._create_track_service(source=track_source)
+        playlist_service: PlaylistService = cls._create_playlist_service(
+            uow_factory=postgres_uow_factory,
+            track_service=track_service,
         )
 
         voice_client_lookup: VoiceClientLookup = cls._create_voice_client_lookup()
@@ -80,14 +85,12 @@ class Container:
         playback_actors: GuildPlaybackActorRegistry = cls._create_playback_actors(
             playback_repository=playback_repository,
             player_factory=player_factory,
-            metadata_resolver=catalog_backed_metadata_resolver,
+            playlist_service=playlist_service,
+            track_service=track_service,
+            uow_factory=postgres_uow_factory,
         )
         playback_manager: GuildPlaybackActorManager = cls._create_playback_manager(
             playback_actors=playback_actors
-        )
-        playlist_service: PlaylistService = cls._create_playlist_service(
-            uow_factory=playlist_uow_factory,
-            metadata_resolver=catalog_backed_metadata_resolver,
         )
         discord_dependencies: DiscordDependencies = cls._create_discord_dependencies(
             playback_manager=playback_manager,
@@ -106,10 +109,10 @@ class Container:
             discord_bot=discord_bot,
         )
 
-        return cls(
+        container = cls(
             settings=settings,
             postgres_engine=postgres_engine,
-            playlist_uow_factory=playlist_uow_factory,
+            postgres_uow_factory=postgres_uow_factory,
             redis_client=redis_client,
             playback_repository=playback_repository,
             track_source=track_source,
@@ -117,6 +120,13 @@ class Container:
             discord_bot=discord_bot,
             _exit_stack=exit_stack,
         )
+        logger.info(
+            "Application container created track_source=%s playback_repository=%s uow_factory=%s",
+            type(track_source).__name__,
+            type(playback_repository).__name__,
+            type(postgres_uow_factory).__name__,
+        )
+        return container
 
     @staticmethod
     def _create_postgres_engine(*, settings: Settings) -> AsyncEngine:
@@ -129,10 +139,10 @@ class Container:
         return create_session_factory(engine=engine)
 
     @staticmethod
-    def _create_playlist_uow_factory(
+    def _create_postgres_uow_factory(
         *, session_factory: async_sessionmaker[AsyncSession]
-    ) -> PostgresPlaylistUoWFactory:
-        return PostgresPlaylistUoWFactory(session_factory=session_factory)
+    ) -> PostgresUoWFactory:
+        return PostgresUoWFactory(session_factory=session_factory)
 
     @staticmethod
     def _create_redis_client(*, settings: Settings) -> Redis:
@@ -158,28 +168,21 @@ class Container:
         return DiscordVoiceManager(lookup=lookup)
 
     @staticmethod
-    def _create_track_source() -> YtDlpTrackSource:
-        return YtDlpTrackSource()
+    def _create_track_source() -> TrackSource:
+        return TrackSourceRouter(sources=(YtDlpTrackSource(),))
 
     @staticmethod
-    def _create_track_catalog(
-        *, session_factory: async_sessionmaker[AsyncSession]
-    ) -> PostgresTrackCatalog:
-        return PostgresTrackCatalog(session_factory=session_factory)
-
-    @staticmethod
-    def _create_catalog_backed_metadata_resolver(
+    def _create_track_service(
         *,
-        inner: TrackMetadataResolver,
-        catalog: TrackCatalog,
-    ) -> CatalogBackedTrackMetadataResolver:
-        return CatalogBackedTrackMetadataResolver(inner=inner, catalog=catalog)
+        source: TrackMetadataResolver,
+    ) -> TrackService:
+        return TrackService(source=source)
 
     @staticmethod
     def _create_player_factory(
         *,
         voice_client_lookup: VoiceClientLookup,
-        stream_resolver: TrackSource,
+        stream_resolver: TrackStreamResolver,
     ) -> DiscordGuildPlayerFactory:
         return DiscordGuildPlayerFactory(
             stream_resolver=stream_resolver,
@@ -191,12 +194,16 @@ class Container:
         *,
         playback_repository: GuildPlaybackRepository,
         player_factory: GuildPlayerFactory,
-        metadata_resolver: TrackMetadataResolver,
+        playlist_service: PlaylistService,
+        track_service: TrackService,
+        uow_factory: UoWFactory,
     ) -> GuildPlaybackActorRegistry:
         return GuildPlaybackActorRegistry(
             playback_repository=playback_repository,
             player_factory=player_factory,
-            metadata_resolver=metadata_resolver,
+            playlist_service=playlist_service,
+            track_service=track_service,
+            uow_factory=uow_factory,
         )
 
     @staticmethod
@@ -209,10 +216,10 @@ class Container:
     @staticmethod
     def _create_playlist_service(
         *,
-        uow_factory: PostgresPlaylistUoWFactory,
-        metadata_resolver: TrackMetadataResolver,
+        uow_factory: UoWFactory,
+        track_service: TrackService,
     ) -> PlaylistService:
-        return PlaylistService(uow_factory=uow_factory, metadata_resolver=metadata_resolver)
+        return PlaylistService(uow_factory=uow_factory, track_service=track_service)
 
     @staticmethod
     def _create_discord_dependencies(
@@ -258,7 +265,10 @@ class Container:
 
     async def start(self) -> None:
         token: str = self.settings.discord_token.get_secret_value()
+        logger.info("Starting Discord bot")
         await self.discord_bot.start(token)
 
     async def close(self) -> None:
+        logger.info("Closing application container")
         await self._exit_stack.aclose()
+        logger.info("Application container closed")

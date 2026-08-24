@@ -21,4 +21,12 @@ class TrackFinishedEventListener:
             )
             self._playback.disable_loop()
 
-        return self._playback.finish_first()
+        has_tracks: bool = self._playback.finish_first()
+        logger.info(
+            "Playback advanced after track finish guild_id=%s has_next=%s queue_size=%s loop=%s",
+            self._playback.guild_id,
+            has_tracks,
+            self._playback.track_count,
+            self._playback.loop_current,
+        )
+        return has_tracks

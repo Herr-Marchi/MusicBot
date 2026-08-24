@@ -12,18 +12,15 @@ class GuildPlayback:
         self,
         *,
         guild_id: int,
-        queue: Queue,
+        queue: Queue | None = None,
         loop_current: bool = False,
         paused: bool = False,
         volume: int = 100,
     ) -> None:
         if guild_id <= 0:
             raise ValueError("guild_id must be positive")
-        if not queue:
-            raise ValueError("GuildPlayback requires a non-empty queue")
-
         self._guild_id: int = guild_id
-        self._queue: Queue = queue
+        self._queue: Queue = queue if queue is not None else Queue()
         self._loop_current: bool = loop_current
         self._paused: bool = paused
         self._volume: int = 100
@@ -54,11 +51,14 @@ class GuildPlayback:
         return len(self._queue)
 
     @property
-    def first_track(self) -> Track:
-        track: Track | None = self._queue.peek()
-        if track is None:
-            raise RuntimeError("GuildPlayback queue is empty")
+    def current_track(self) -> Track | None:
+        return self._queue.peek()
 
+    @property
+    def first_track(self) -> Track:
+        track: Track | None = self.current_track
+        if track is None:
+            raise RuntimeError("GuildPlayback has no tracks")
         return track
 
     def enqueue(self, track: Track) -> None:
@@ -76,6 +76,7 @@ class GuildPlayback:
 
     def skip(self) -> bool:
         self.disable_loop()
+        self.resume()
         self._queue.dequeue()
         return bool(self._queue)
 

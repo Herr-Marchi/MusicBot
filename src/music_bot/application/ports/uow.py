@@ -4,16 +4,20 @@ from collections.abc import Callable
 from types import TracebackType
 from typing import Protocol, Self
 
-from .playlist_repository import PlaylistRepository
-from .user_repository import UserRepository
+from music_bot.application.ports.playlists.playlist_repository import PlaylistRepository
+from music_bot.application.ports.playlists.user_repository import UserRepository
+from music_bot.application.ports.track_repository import TrackRepository
 
 
-class PlaylistUoW(Protocol):
+class UoW(Protocol):
     @property
     def user_repository(self) -> UserRepository: ...
 
     @property
     def playlist_repository(self) -> PlaylistRepository: ...
+
+    @property
+    def track_repository(self) -> TrackRepository: ...
 
     async def __aenter__(self) -> Self: ...
 
@@ -29,4 +33,4 @@ class PlaylistUoW(Protocol):
     async def rollback(self) -> None: ...
 
 
-type PlaylistUoWFactory = Callable[[], PlaylistUoW]
+type UoWFactory = Callable[[], UoW]

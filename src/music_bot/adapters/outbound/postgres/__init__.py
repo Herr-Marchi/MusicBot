@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 from .engine import create_engine, create_session_factory
-from .repositories import PostgresTrackCatalog
-from .uow import PostgresPlaylistUoW, PostgresPlaylistUoWFactory
+from .uow import PostgresUoW, PostgresUoWFactory
 
 __all__ = (
-    "PostgresPlaylistUoW",
-    "PostgresPlaylistUoWFactory",
-    "PostgresTrackCatalog",
+    "PostgresUoW",
+    "PostgresUoWFactory",
     "create_engine",
     "create_session_factory",
 )

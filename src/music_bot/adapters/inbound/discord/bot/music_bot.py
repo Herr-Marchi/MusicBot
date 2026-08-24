@@ -35,12 +35,14 @@ class MusicBot(commands.Bot):
         voice_client_lookup.bind(self)
 
     async def setup_hook(self) -> None:
+        logger.info("Discord setup started")
         await super().setup_hook()
 
         await self.add_cog(PingCog(self))
         await self.add_cog(VoiceCog(self, deps=self.dependencies))
         await self.add_cog(PlaybackCog(self, deps=self.dependencies))
         await self.add_cog(PlaylistCog(self, deps=self.dependencies))
+        logger.debug("Discord cogs registered count=4")
 
         synced: list[app_commands.AppCommand]
         if self.dev_guild_id is not None:
@@ -49,11 +51,14 @@ class MusicBot(commands.Bot):
             self.tree.clear_commands(guild=guild)
             self.tree.copy_global_to(guild=guild)
 
+            logger.debug("Discord command sync started scope=guild guild_id=%s", self.dev_guild_id)
             synced = await self.tree.sync(guild=guild)
             logger.info(f"Synced {len(synced)} command(s) to dev guild {self.dev_guild_id}")
         else:
+            logger.debug("Discord command sync started scope=global")
             synced = await self.tree.sync()
             logger.info(f"Synced {len(synced)} global command(s)")
+        logger.info("Discord setup completed")
 
     async def on_ready(self) -> None:
         user: ClientUser | None = self.user
@@ -62,3 +67,17 @@ class MusicBot(commands.Bot):
             logger.warning("Logged in, but user is not available yet.")
         else:
             logger.info(f"Logged in as {user} (ID: {user.id})")
+
+    async def on_app_command_completion(
+        self,
+        interaction: discord.Interaction,
+        command: object,
+    ) -> None:
+        command_name: object = getattr(command, "qualified_name", type(command).__name__)
+        logger.info(
+            "Discord command completed interaction_id=%s command=%s guild_id=%s user_id=%s",
+            interaction.id,
+            command_name,
+            interaction.guild_id,
+            interaction.user.id,
+        )

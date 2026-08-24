@@ -3,11 +3,11 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 import pytest
-from tests.fakes import FakePlaylistUoWFactory, FakeTrackSource
+from tests.fakes import FakeTrackSource, FakeUoWFactory
 
 from music_bot.application.contracts.errors import NotPlaylistOwnerError, PlaylistNotFoundError
 from music_bot.application.orchestration.playlists.service import PlaylistService
-from music_bot.application.ports.playlists import PlaylistData, PlaylistTrackData
+from music_bot.application.ports.playlists import PlaylistData, PlaylistEntry
 from music_bot.domain.playlists.models import PlaylistAccess
 
 OWNER_ID = 1
@@ -19,7 +19,7 @@ class TestCreate:
     async def test_create_persists_playlist_and_upserts_owner(
         self,
         playlist_service: PlaylistService,
-        fake_uow_factory: FakePlaylistUoWFactory,
+        fake_uow_factory: FakeUoWFactory,
     ) -> None:
         playlist: PlaylistData = await playlist_service.create(
             owner_id=OWNER_ID,
@@ -127,7 +127,7 @@ class TestDelete:
     async def test_delete_removes_playlist(
         self,
         playlist_service: PlaylistService,
-        fake_uow_factory: FakePlaylistUoWFactory,
+        fake_uow_factory: FakeUoWFactory,
     ) -> None:
         playlist: PlaylistData = await playlist_service.create(
             owner_id=OWNER_ID, owner_username="alice", title="Gone", access=PlaylistAccess.PRIVATE
@@ -190,6 +190,7 @@ class TestTracks:
         self,
         playlist_service: PlaylistService,
         fake_track_source: FakeTrackSource,
+        fake_uow_factory: FakeUoWFactory,
     ) -> None:
         fake_track_source.set_metadata(
             "https://example.com/a.mp3", title="Song A", duration_seconds=180
@@ -197,8 +198,9 @@ class TestTracks:
         playlist: PlaylistData = await playlist_service.create(
             owner_id=OWNER_ID, owner_username="alice", title="Mix", access=PlaylistAccess.PRIVATE
         )
+        uow_count_before_add: int = len(fake_uow_factory.uows)
 
-        track: PlaylistTrackData = await playlist_service.add_track(
+        track: PlaylistEntry = await playlist_service.add_track(
             playlist_id=playlist.id,
             requested_by=OWNER_ID,
             url="https://example.com/a.mp3",
@@ -207,6 +209,8 @@ class TestTracks:
         assert track.track.title == "Song A"
         assert track.track.duration_seconds == 180
         assert track.position == 0
+        assert len(fake_uow_factory.uows) == uow_count_before_add + 1
+        assert fake_uow_factory.uows[-1].commit_calls == 1
 
     async def test_second_track_appends_after_first(
         self,
@@ -222,7 +226,7 @@ class TestTracks:
         await playlist_service.add_track(
             playlist_id=playlist.id, requested_by=OWNER_ID, url="https://example.com/a.mp3"
         )
-        second: PlaylistTrackData = await playlist_service.add_track(
+        second: PlaylistEntry = await playlist_service.add_track(
             playlist_id=playlist.id, requested_by=OWNER_ID, url="https://example.com/b.mp3"
         )
 
