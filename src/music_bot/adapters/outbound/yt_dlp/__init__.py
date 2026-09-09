@@ -1,5 +1,6 @@
 from __future__ import annotations
 
-from .youtube import YtDlpTrackSource
+from .base import YtDlpTrackSource
+from .soundcloud import SoundCloudTrackSource
 
-__all__ = ("YtDlpTrackSource",)
+__all__ = ("SoundCloudTrackSource", "YtDlpTrackSource")

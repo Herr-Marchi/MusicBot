@@ -28,18 +28,13 @@ type YtDlpInfo = Mapping[str, object]
 
 
 class YtDlpTrackSource(TrackSource):
-    SOURCE_HOSTS: ClassVar[frozenset[str]] = frozenset(
-        {
-            "youtube.com",
-            "www.youtube.com",
-            "m.youtube.com",
-            "music.youtube.com",
-            "youtu.be",
-        }
-    )
-    STREAM_HOST_SUFFIXES: ClassVar[frozenset[str]] = frozenset(
-        {"googlevideo.com", "youtube.com", "youtu.be"}
-    )
+    """Generic yt-dlp-backed TrackSource. Not tied to any one site: a
+    concrete subclass just supplies the hosts it owns and the hosts its
+    resolved stream URLs are allowed to come from. All the extraction,
+    ownership-check, and SSRF-safety plumbing lives here once."""
+
+    SOURCE_HOSTS: ClassVar[frozenset[str]]
+    STREAM_HOST_SUFFIXES: ClassVar[frozenset[str]]
 
     async def validate_url(self, *, source_url: str) -> TrackSource:
         hostname: str | None = urlsplit(source_url).hostname

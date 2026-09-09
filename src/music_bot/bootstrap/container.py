@@ -20,7 +20,7 @@ from music_bot.adapters.outbound.postgres import (
 )
 from music_bot.adapters.outbound.redis import RedisGuildPlaybackRepository, create_redis_client
 from music_bot.adapters.outbound.track_source_router import TrackSourceRouter
-from music_bot.adapters.outbound.yt_dlp import YtDlpTrackSource
+from music_bot.adapters.outbound.yt_dlp import SoundCloudTrackSource
 from music_bot.application.orchestration.music import (
     GuildPlaybackActorManager,
     GuildPlaybackActorRegistry,
@@ -169,7 +169,7 @@ class Container:
 
     @staticmethod
     def _create_track_source() -> TrackSource:
-        return TrackSourceRouter(sources=(YtDlpTrackSource(),))
+        return TrackSourceRouter(sources=(SoundCloudTrackSource(),))
 
     @staticmethod
     def _create_track_service(

@@ -1,20 +1,29 @@
 from __future__ import annotations
 
+from typing import ClassVar
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 from yt_dlp.utils import DownloadError
 
 from music_bot.adapters.outbound.url_safety import UnsafeUrlError
-from music_bot.adapters.outbound.yt_dlp.youtube import YtDlpTrackSource
+from music_bot.adapters.outbound.yt_dlp.base import YtDlpTrackSource
 from music_bot.application.ports.track_source import TrackNotOwnedError, TrackSourceError
+
+
+class _FakeTrackSource(YtDlpTrackSource):
+    """Site-agnostic stand-in used to test the shared yt-dlp plumbing
+    without depending on any real site's host names."""
+
+    SOURCE_HOSTS: ClassVar[frozenset[str]] = frozenset({"example.com", "example.test"})
+    STREAM_HOST_SUFFIXES: ClassVar[frozenset[str]] = frozenset({"cdn.example.com"})
 
 
 @pytest.fixture
 def allow_safe_url(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
     check = AsyncMock()
     monkeypatch.setattr(
-        "music_bot.adapters.outbound.yt_dlp.youtube.ensure_safe_url",
+        "music_bot.adapters.outbound.yt_dlp.base.ensure_safe_url",
         check,
     )
     return check
@@ -29,23 +38,23 @@ class TestYtDlpTrackSource:
     ) -> None:
         youtube_dl = MagicMock()
         youtube_dl.__enter__.return_value.extract_info.return_value = {
-            "webpage_url": "https://www.youtube.com/watch?v=id",
+            "webpage_url": "https://example.com/watch?v=id",
             "title": "Song",
             "duration": 123,
         }
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
-        metadata = await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+        metadata = await _FakeTrackSource().resolve_metadata(source_url="https://example.test/id")
 
-        assert metadata.url == "https://www.youtube.com/watch?v=id"
+        assert metadata.url == "https://example.com/watch?v=id"
         assert metadata.title == "Song"
         assert metadata.duration_seconds == 123
         assert allow_safe_url.await_args_list == [
-            (("https://youtu.be/id",), {}),
-            (("https://www.youtube.com/watch?v=id",), {}),
+            (("https://example.test/id",), {}),
+            (("https://example.com/watch?v=id",), {}),
         ]
 
     async def test_resolve_stream_returns_direct_url(
@@ -55,26 +64,24 @@ class TestYtDlpTrackSource:
     ) -> None:
         youtube_dl = MagicMock()
         youtube_dl.__enter__.return_value.extract_info.return_value = {
-            "url": "https://cdn.googlevideo.com/audio"
+            "url": "https://cdn.example.com/audio"
         }
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
-        stream_url = await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+        stream_url = await _FakeTrackSource().resolve_stream(source_url="https://example.test/id")
 
-        assert stream_url == "https://cdn.googlevideo.com/audio"
+        assert stream_url == "https://cdn.example.com/audio"
         assert allow_safe_url.await_args_list == [
-            (("https://youtu.be/id",), {}),
-            (("https://cdn.googlevideo.com/audio",), {}),
+            (("https://example.test/id",), {}),
+            (("https://cdn.example.com/audio",), {}),
         ]
 
-    async def test_rejects_non_youtube_url_before_safety_check(
-        self, allow_safe_url: AsyncMock
-    ) -> None:
+    async def test_rejects_unowned_url_before_safety_check(self, allow_safe_url: AsyncMock) -> None:
         with pytest.raises(TrackSourceError):
-            await YtDlpTrackSource().resolve_metadata(source_url="https://example.com/track")
+            await _FakeTrackSource().resolve_metadata(source_url="https://attacker.test/track")
 
         allow_safe_url.assert_not_awaited()
 
@@ -82,8 +89,8 @@ class TestYtDlpTrackSource:
         self, allow_safe_url: AsyncMock
     ) -> None:
         with pytest.raises(TrackNotOwnedError):
-            await YtDlpTrackSource().resolve_metadata(
-                source_url="https://youtube.com.attacker.test/watch?v=id"
+            await _FakeTrackSource().resolve_metadata(
+                source_url="https://example.com.attacker.test/watch?v=id"
             )
 
         allow_safe_url.assert_not_awaited()
@@ -96,12 +103,12 @@ class TestYtDlpTrackSource:
         allow_safe_url.side_effect = UnsafeUrlError("unsafe")
         youtube_dl_factory = MagicMock()
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             youtube_dl_factory,
         )
 
         with pytest.raises(TrackSourceError, match="unsafe"):
-            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+            await _FakeTrackSource().resolve_metadata(source_url="https://example.test/id")
 
         youtube_dl_factory.assert_not_called()
 
@@ -117,21 +124,21 @@ class TestYtDlpTrackSource:
             "duration": 1,
         }
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
         with pytest.raises(TrackNotOwnedError):
-            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+            await _FakeTrackSource().resolve_metadata(source_url="https://example.test/id")
 
-        allow_safe_url.assert_awaited_once_with("https://youtu.be/id")
+        allow_safe_url.assert_awaited_once_with("https://example.test/id")
 
     @pytest.mark.parametrize(
         "stream_url",
         [
-            "https://googlevideo.com.attacker.test/audio",
-            "https://evilgooglevideo.com/audio",
-            "https://attacker.test/googlevideo.com/audio",
+            "https://cdn.example.com.attacker.test/audio",
+            "https://evilcdn.example.com/audio",
+            "https://attacker.test/cdn.example.com/audio",
         ],
     )
     async def test_rejects_stream_host_allowlist_bypass(
@@ -143,31 +150,31 @@ class TestYtDlpTrackSource:
         youtube_dl = MagicMock()
         youtube_dl.__enter__.return_value.extract_info.return_value = {"url": stream_url}
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
         with pytest.raises(TrackSourceError, match="stream URL is not supported"):
-            await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+            await _FakeTrackSource().resolve_stream(source_url="https://example.test/id")
 
-        allow_safe_url.assert_awaited_once_with("https://youtu.be/id")
+        allow_safe_url.assert_awaited_once_with("https://example.test/id")
 
     async def test_rejects_unsafe_allowed_stream_before_returning_it(
         self,
         monkeypatch: pytest.MonkeyPatch,
         allow_safe_url: AsyncMock,
     ) -> None:
-        stream_url = "https://cdn.googlevideo.com/audio"
+        stream_url = "https://cdn.example.com/audio"
         allow_safe_url.side_effect = [None, UnsafeUrlError("private address")]
         youtube_dl = MagicMock()
         youtube_dl.__enter__.return_value.extract_info.return_value = {"url": stream_url}
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
         with pytest.raises(TrackSourceError, match="private address"):
-            await YtDlpTrackSource().resolve_stream(source_url="https://youtu.be/id")
+            await _FakeTrackSource().resolve_stream(source_url="https://example.test/id")
 
         assert allow_safe_url.await_count == 2
 
@@ -180,11 +187,11 @@ class TestYtDlpTrackSource:
         youtube_dl = MagicMock()
         youtube_dl.__enter__.return_value.extract_info.side_effect = DownloadError(sensitive_detail)
         monkeypatch.setattr(
-            "music_bot.adapters.outbound.yt_dlp.youtube.YoutubeDL",
+            "music_bot.adapters.outbound.yt_dlp.base.YoutubeDL",
             MagicMock(return_value=youtube_dl),
         )
 
         with pytest.raises(TrackSourceError) as exc_info:
-            await YtDlpTrackSource().resolve_metadata(source_url="https://youtu.be/id")
+            await _FakeTrackSource().resolve_metadata(source_url="https://example.test/id")
 
         assert sensitive_detail not in str(exc_info.value)
